@@ -1,0 +1,15 @@
+{
+    "config": {
+      "step": {
+        "user": {
+          "title": "Configure My Heater",
+          "description": "Set up your heater",
+          "data": {
+            "heater_name": "Heater Name",
+            "scene_turn_on_off": "Scene to turn on/off"
+          }
+        }
+      }
+    }
+  }
+  
