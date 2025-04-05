@@ -130,6 +130,3 @@ Once configured, you can add the "My Heater" climate entity to your dashboard. Y
 * **Scene Dependency:** The integration's effectiveness is entirely dependent on the correct configuration and reliable execution of the three required Home Assistant scenes. If scene activation fails, the heater won't respond as expected.
 * **Basic Temp Maintenance:** The temperature maintenance logic is basic and reactive. It doesn't implement sophisticated PID control. It relies on large deviations and power state checks.
 
-## License
-
-MIT License (You can add the full license text here if desired)
