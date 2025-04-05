@@ -10,8 +10,8 @@ This custom integration provides a Home Assistant `climate` entity to control he
 
 This integration was developed considering hardware like:
 
-* **Power Monitoring Plug:** [Zigbee Smart Plug with Power Monitoring](https://he.aliexpress.com/item/1005005481310738.html) (or similar Tuya/Zigbee plugs integrated via ZHA/Zigbee2MQTT)
-* **Temperature Sensor & IR Blaster:** [Moes Zigbee Thermostat / IR Remote ZHT-006-GB](https://he.aliexpress.com/item/1005003603612061.html) (or similar devices providing temperature sensing and IR remote control capabilities integrated via ZHA/Zigbee2MQTT). *Note: The IR capability of such devices is used via scenes.*
+* **Power Monitoring Plug:** [Wifi/Zigbee Smart Plug with Power Monitoring](https://he.aliexpress.com/item/1005005481310738.html) (or similar Tuya/Zigbee plugs integrated via ZHA/Zigbee2MQTT)
+* **Temperature Sensor & IR Blaster:** [Wifi/Zigbee Thermostat / IR Remote ZHT-006-GB](https://he.aliexpress.com/item/1005003603612061.html) (or similar devices providing temperature sensing and IR remote control capabilities integrated via ZHA/Zigbee2MQTT). *Note: The IR capability of such devices is used via scenes.*
 
 **Example UI:**
 
