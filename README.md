@@ -15,8 +15,8 @@ This integration was developed considering hardware like:
 
 **Example UI:**
 
-![Example Climate Entity UI](https://github.com/YOUR_USERNAME/YOUR_REPO/blob/main/images/image_1e673d.png?raw=true)
-*(Replace the image link above with the actual path if you upload the image to a repository)*
+<img width="380" alt="image" src="https://github.com/user-attachments/assets/9862eb96-857f-488a-be88-cca5525839cf" />
+
 
 ## Features
 
