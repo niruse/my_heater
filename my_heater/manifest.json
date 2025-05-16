@@ -2,9 +2,8 @@
     "domain": "my_heater",
     "name": "My Heater",
     "version": "1.0.0",
-    "documentation": "https://example.com",
     "dependencies": [],
-    "codeowners": ["@yourgithubusername"],
+    "codeowners": ["@niruse"],
     "requirements": [],
     "config_flow": true
 }
