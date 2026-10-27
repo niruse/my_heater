@@ -10,6 +10,23 @@
           }
         }
       }
+    },
+    "options": {
+      "step": {
+        "init": {
+          "title": "My Heater options",
+          "data": {
+            "timer": "Auto-off timer (minutes, 0 = off)",
+            "remember_last_temp": "Remember last temperature",
+            "power_threshold": "Heating power threshold (W)",
+            "idle_off_minutes": "Show OFF after this many minutes without heating (0 = never)",
+            "temperature_maintenance": "Press UP/DOWN automatically to hold the target"
+          },
+          "data_description": {
+            "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",
+            "idle_off_minutes": "The heater pauses on its own thermostat for a few minutes. Longer than this with no heating means it was switched off outside Home Assistant."
+          }
+        }
+      }
     }
   }
-  

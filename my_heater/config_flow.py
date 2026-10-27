@@ -7,7 +7,14 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import selector
 
 # Assuming your const.py defines DOMAIN
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    CONF_POWER_THRESHOLD,
+    CONF_IDLE_OFF_MINUTES,
+    CONF_TEMP_MAINTENANCE,
+    DEFAULT_POWER_THRESHOLD,
+    DEFAULT_IDLE_OFF_MINUTES,
+)
 
 import logging
 _LOGGER = logging.getLogger(__name__)
@@ -18,7 +25,16 @@ class MyHeaterOptionsFlowHandler(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
+        self._entry = config_entry
+
+    @property
+    def config_entry(self):
+        """The entry being configured (newer HA sets this on the base class)."""
+        return self._entry
+
+    def _current(self, key, default):
+        """Current value of a setting: options -> data -> default."""
+        return self.config_entry.options.get(key, self.config_entry.data.get(key, default))
 
     async def async_step_init(self, user_input=None):
         """Manage the options."""
@@ -63,6 +79,24 @@ class MyHeaterOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     "remember_last_temp",
                     default=current_remember_last_temp
+                ): bool,
+
+                # Watts that prove the heater is heating (above the wind-down tail)
+                vol.Required(
+                    CONF_POWER_THRESHOLD,
+                    default=self._current(CONF_POWER_THRESHOLD, DEFAULT_POWER_THRESHOLD)
+                ): vol.All(vol.Coerce(float), Range(min=1)),
+
+                # Minutes in HEAT with no heating before showing OFF (0 disables)
+                vol.Required(
+                    CONF_IDLE_OFF_MINUTES,
+                    default=self._current(CONF_IDLE_OFF_MINUTES, DEFAULT_IDLE_OFF_MINUTES)
+                ): vol.All(vol.Coerce(int), Range(min=0)),
+
+                # Let the monitor press UP/DOWN on its own (off by default)
+                vol.Optional(
+                    CONF_TEMP_MAINTENANCE,
+                    default=self._current(CONF_TEMP_MAINTENANCE, False)
                 ): bool,
 
                 # Add other options here in the future

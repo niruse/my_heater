@@ -17,16 +17,31 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity # Use RestoreEntity for state restoration capabilities
 
 # Local constants
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    CONF_POWER_THRESHOLD,
+    CONF_IDLE_OFF_MINUTES,
+    CONF_TEMP_MAINTENANCE,
+    DEFAULT_POWER_THRESHOLD,
+    DEFAULT_IDLE_OFF_MINUTES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 # --- Configuration Constants ---
-MONITORING_INTERVAL_SECONDS = 120  # How often to check temp/power in HEAT mode
-Sleep_After_Power_Off = 60      # How long to wait after timer OFF before checking power again
+MONITORING_INTERVAL_SECONDS = 30   # How often to check timer / idle / temp in HEAT mode
+TEMP_MAINTENANCE_INTERVAL_SECONDS = 120  # Min gap between temp-maintenance IR presses
 SCENE_ACTIVATION_DELAY = 1.0     # Short delay after activating some scenes
-VOLTAGE_ON_THRESHOLD = 10       # Power (W or kW) threshold to consider the heater ON
-AUTO_ON_COOLDOWN_SECONDS = 15    # Min duration after manual OFF before auto ON can trigger
+# After WE send an IR command the heater needs time to react and the plug needs time
+# to report it. Real capture (2026-10-27): after "off" the heater draws ~21 W for
+# 20-35 s while it winds down, and the plug reports the drop up to ~36 s later.
+# Power readings inside this window are never used to guess the heater's state.
+COMMAND_SETTLE_SECONDS = 90
+# Auto-ON double check: a high reading must still be high this long after it was seen.
+AUTO_ON_CONFIRM_SECONDS = 20
+# OFF double check: after the OFF toggle, power must be below the threshold by then.
+OFF_VERIFY_SECONDS = 90
+OFF_VERIFY_RETRIES = 1           # Extra OFF toggles if the heater is still drawing power
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -93,9 +108,15 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
         # --- Internal State Management ---
         self._monitoring_task = None        # Holds the asyncio task for monitoring
+        self._verify_task = None            # OFF double-check after an OFF toggle
+        self._confirm_task = None           # Auto-ON double-check after a high reading
         self._heat_start_time = None        # When heating started (for timer)
         self._options_listener_remove = None # To unsubscribe from options updates
         self.last_mode_change_time = None   # Track last mode change for cooldowns
+        self._last_command_time = None      # Last time WE sent the on/off IR toggle
+        self._last_heating_seen = None      # Last time the plug showed real heating
+        self._last_maintenance_time = None  # Last temp-maintenance IR press
+        self._last_sync_reason = None       # Why the mode last changed without a user command
         self._power_sensor_listener_remove = None # To unsubscribe from power sensor updates
 
         # --- Unique ID ---
@@ -103,14 +124,30 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._attr_unique_id = f"{config_entry.entry_id}_climate"
 
 
-    # --- Helper Property for Timer Duration ---
+    # --- Helper Properties for Options ---
+    def _option(self, key, default):
+        """Return an option value: options -> data -> default."""
+        return self.config_entry.options.get(key, self.config_entry.data.get(key, default))
+
     @property
     def _timer_duration_minutes(self) -> int:
         """Return the configured timer duration in minutes."""
-        # Get timer from options first, fallback to initial data
-        return self.config_entry.options.get(
-            "timer", self.config_entry.data.get("timer", 0)
-        )
+        return self._option("timer", 0)
+
+    @property
+    def _power_threshold(self) -> float:
+        """Watts above which the heater is really heating (not winding down)."""
+        return float(self._option(CONF_POWER_THRESHOLD, DEFAULT_POWER_THRESHOLD))
+
+    @property
+    def _idle_off_minutes(self) -> int:
+        """Minutes in HEAT without any heating before the heater is treated as off."""
+        return int(self._option(CONF_IDLE_OFF_MINUTES, DEFAULT_IDLE_OFF_MINUTES))
+
+    @property
+    def _temp_maintenance_enabled(self) -> bool:
+        """Whether the monitor may press the UP/DOWN scenes on its own."""
+        return bool(self._option(CONF_TEMP_MAINTENANCE, False))
 
     # --- Standard Properties ---
     @property
@@ -130,23 +167,51 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
     @property
     def current_power_usage(self):
-        """Get the current power usage from the sensor."""
+        """Get the current power usage from the sensor, in watts."""
         if not self._power_usage_sensor: return None
-        sensor_state = self._hass.states.get(self._power_usage_sensor)
+        return self._power_watts(self._hass.states.get(self._power_usage_sensor))
+
+    def _power_watts(self, sensor_state: State | None):
+        """Convert a power sensor state to watts (kW sensors are scaled up)."""
         if sensor_state and sensor_state.state not in (None, "unknown", "unavailable"):
             try:
-                return float(sensor_state.state)
+                value = float(sensor_state.state)
             except (ValueError, TypeError):
                 _LOGGER.warning(
                     "%s: Power usage sensor %s returned invalid value: %s",
                     self.entity_id, self._power_usage_sensor, sensor_state.state,
                 )
+                return None
+            if sensor_state.attributes.get("unit_of_measurement") == "kW":
+                value *= 1000
+            return value
         return None
+
+    def _is_heating(self, power) -> bool:
+        """True only for a reading that proves the heating element is on."""
+        return power is not None and power >= self._power_threshold
+
+    def _in_settle_window(self, now=None) -> bool:
+        """True while the heater may still be reacting to our last IR toggle."""
+        if self._last_command_time is None:
+            return False
+        now = now or datetime.now(timezone.utc)
+        return (now - self._last_command_time).total_seconds() < COMMAND_SETTLE_SECONDS
 
     @property
     def target_temperature_step(self):
         """Return the supported step for temperature adjustment."""
         return 1.0
+
+    @property
+    def extra_state_attributes(self):
+        """Expose what the integration believes and why, for troubleshooting."""
+        return {
+            "power_threshold": self._power_threshold,
+            "last_heating_seen": self._last_heating_seen.isoformat() if self._last_heating_seen else None,
+            "last_command": self._last_command_time.isoformat() if self._last_command_time else None,
+            "last_sync_reason": self._last_sync_reason,
+        }
 
 
     # --- Core Methods ---
@@ -161,8 +226,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
              _LOGGER.debug("%s: Requested HVAC mode %s is already active.", self.entity_id, hvac_mode)
              return
 
-        # Stop any existing monitoring task before changing mode
+        # Stop any existing monitoring / double-check tasks before changing mode
         await self._stop_monitoring_task()
+        self._cancel_task("_verify_task")
+        self._cancel_task("_confirm_task")
         scene_activated = False
 
         if hvac_mode == HVACMode.HEAT:
@@ -176,37 +243,36 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 await asyncio.sleep(10)
 
             power = self.current_power_usage
-            _LOGGER.debug("%s: Checking power usage for HEAT mode switch: value=%s, threshold=%s", self.entity_id, power, VOLTAGE_ON_THRESHOLD)
+            _LOGGER.debug("%s: Checking power usage for HEAT mode switch: value=%s, threshold=%s", self.entity_id, power, self._power_threshold)
 
-            # Activate ON scene only if power is low/unknown (or sensor missing)
-            if self._power_usage_sensor and (power is None or power < VOLTAGE_ON_THRESHOLD):
-                 _LOGGER.debug("%s: Power usage low/unknown. Activating ON/OFF scene for HEAT.", self.entity_id)
-                 scene_activated = await self._activate_scene(self._scene_turn_on_off, "turn ON for HEAT")
-                 if scene_activated: await asyncio.sleep(SCENE_ACTIVATION_DELAY)
-            elif not self._power_usage_sensor:
-                 _LOGGER.debug("%s: Power sensor not configured. Activating ON/OFF scene for HEAT as failsafe.", self.entity_id)
-                 scene_activated = await self._activate_scene(self._scene_turn_on_off, "turn ON for HEAT (no power sensor)")
-                 if scene_activated: await asyncio.sleep(SCENE_ACTIVATION_DELAY)
+            # Send the toggle unless the plug proves the heater is already heating
+            if self._is_heating(power):
+                 _LOGGER.debug("%s: Power usage (%.2f) >= threshold (%s). Assuming ON. Skipping scene activation.", self.entity_id, power, self._power_threshold)
             else:
-                 # Power is high, assume already ON physically
-                 _LOGGER.debug("%s: Power usage (%.2f) >= threshold (%s). Assuming ON. Skipping scene activation.", self.entity_id, power, VOLTAGE_ON_THRESHOLD)
+                 _LOGGER.debug("%s: Power usage low/unknown. Activating ON/OFF scene for HEAT.", self.entity_id)
+                 scene_activated = await self._send_toggle("turn ON for HEAT")
+                 if scene_activated: await asyncio.sleep(SCENE_ACTIVATION_DELAY)
 
             # Set internal state and start monitoring
+            now = datetime.now(timezone.utc)
             self._attr_hvac_mode = HVACMode.HEAT
             self._heat_start_time = now # Record start time for timer
+            self._last_heating_seen = now # Idle-off counts from here
             self.last_mode_change_time = now # Record mode change time
+            self._last_sync_reason = None
             await self._start_monitoring_task()
             _LOGGER.info("%s: Set HVAC mode to HEAT. Monitoring task started. Scene activated: %s", self.entity_id, scene_activated)
 
         elif hvac_mode == HVACMode.OFF:
             _LOGGER.debug("%s: Attempting to switch to OFF mode.", self.entity_id)
-            # Activate the OFF scene
-            scene_activated = await self._activate_scene(self._scene_turn_on_off, "turn OFF")
-            # Set internal state (monitoring task already stopped by call above)
+            scene_activated = await self._send_toggle("turn OFF")
             self._attr_hvac_mode = HVACMode.OFF
             self._heat_start_time = None # Clear timer start time
-            self.last_mode_change_time = now # Record mode change time
-            _LOGGER.info("%s: Set HVAC mode to OFF. Monitoring task stopped. Scene activated: %s", self.entity_id, scene_activated)
+            self.last_mode_change_time = datetime.now(timezone.utc) # Record mode change time
+            self._last_sync_reason = None
+            # Double check in the background that the heater really stopped
+            self._verify_task = self.hass.async_create_task(self._verify_off("manual OFF"))
+            _LOGGER.info("%s: Set HVAC mode to OFF. OFF verification scheduled. Scene activated: %s", self.entity_id, scene_activated)
 
         else:
              _LOGGER.warning("%s: Unsupported HVAC mode requested: %s.", self.entity_id, hvac_mode)
@@ -262,7 +328,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         if success_count == steps:
             # If all steps succeeded, ensure it's exactly the requested target_temp
             self._attr_target_temperature = target_temp
-            _LOGGER.debug("%s: Finished setting target temperature to: %.1f°C", self.entity_id, self._attr_target_temperature)
+            _LOGGER.debug("%s: Finished setting target temperature to: %.1f", self.entity_id, self._attr_target_temperature)
         else:
              # If steps failed, update to the partially achieved temperature
              self._attr_target_temperature = new_calculated_temp
@@ -274,7 +340,14 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self.async_write_ha_state() # Update HA state with the final temperature
 
 
-    # --- Monitoring Task Management ---
+    # --- Task Management ---
+    def _cancel_task(self, attr):
+        """Cancel a helper task stored on self.<attr> (if it is not the caller)."""
+        task = getattr(self, attr)
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        setattr(self, attr, None)
+
     async def _start_monitoring_task(self):
         """Start the background monitoring task if not already running."""
         if self._monitoring_task is None or self._monitoring_task.done():
@@ -286,6 +359,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
     async def _stop_monitoring_task(self):
         """Stop the background monitoring task gracefully."""
         if self._monitoring_task and not self._monitoring_task.done():
+            if self._monitoring_task is asyncio.current_task():
+                # Called from inside the monitor (timer/idle-off): it exits on its own
+                self._monitoring_task = None
+                return
             _LOGGER.debug("%s: Attempting to cancel monitoring task.", self.entity_id)
             self._monitoring_task.cancel()
             try:
@@ -302,9 +379,61 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
              _LOGGER.debug("%s: No active monitoring task to stop.", self.entity_id)
 
 
+    # --- OFF Double Check ---
+    async def _verify_off(self, reason):
+        """After an OFF toggle, confirm with the plug that heating stopped.
+
+        Only a reading at or above the threshold counts as "still on": the ~21 W
+        wind-down tail and a heater idling on its own thermostat both read low.
+        A missed IR command leaves the element drawing 1-2 kW, so a high reading
+        after OFF_VERIFY_SECONDS proves the toggle did not land and is safe to resend.
+        """
+        try:
+            for attempt in range(OFF_VERIFY_RETRIES + 1):
+                await asyncio.sleep(OFF_VERIFY_SECONDS)
+                if self._attr_hvac_mode != HVACMode.OFF:
+                    return
+                power = self.current_power_usage
+                if not self._is_heating(power):
+                    _LOGGER.debug("%s: OFF verified after %s (power %s).", self.entity_id, reason, power)
+                    return
+                if attempt < OFF_VERIFY_RETRIES:
+                    _LOGGER.warning(
+                        "%s: Still drawing %.1f W %ds after %s. Sending OFF toggle again.",
+                        self.entity_id, power, OFF_VERIFY_SECONDS, reason,
+                    )
+                    await self._send_toggle(f"{reason} retry {attempt + 1}")
+            # Still heating after the retries: tell the truth instead of showing OFF
+            _LOGGER.error(
+                "%s: Heater still drawing %.1f W after %d OFF attempts. Showing HEAT.",
+                self.entity_id, power, OFF_VERIFY_RETRIES + 1,
+            )
+            self._sync_mode(HVACMode.HEAT, "off_failed")
+        except asyncio.CancelledError:
+            pass
+
+
+    # --- Mode Sync (no IR sent) ---
+    def _sync_mode(self, hvac_mode, reason):
+        """Change the shown mode to match the real heater, without sending IR."""
+        now = datetime.now(timezone.utc)
+        self._attr_hvac_mode = hvac_mode
+        self.last_mode_change_time = now
+        self._last_sync_reason = reason
+        if hvac_mode == HVACMode.HEAT:
+            if self._heat_start_time is None:
+                self._heat_start_time = now
+            self._last_heating_seen = now
+            self.hass.async_create_task(self._start_monitoring_task())
+        else:
+            self._heat_start_time = None
+        _LOGGER.info("%s: Synced mode to %s (%s).", self.entity_id, hvac_mode, reason)
+        self.async_write_ha_state()
+
+
     # --- Monitoring Task ---
     async def _monitor_power_and_temperature(self):
-        """Background task for timer and temperature maintenance while in HEAT mode."""
+        """Background task for timer, idle-off detection and temperature maintenance while in HEAT mode."""
         _LOGGER.info("Monitoring task started for %s.", self.entity_id)
         try:
             while True:
@@ -313,100 +442,54 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     break
 
                 now = datetime.now(timezone.utc)
+                power = self.current_power_usage
+                if self._is_heating(power):
+                    self._last_heating_seen = now
 
-                # --- 1. Timer Check --- # <<< CORRECTED TIMER LOGIC >>>
+                # --- 1. Timer Check ---
                 timer_duration_minutes = self._timer_duration_minutes
                 if timer_duration_minutes > 0 and self._heat_start_time:
                     elapsed_seconds = (now - self._heat_start_time).total_seconds()
-                    timer_duration_seconds = timer_duration_minutes * 60
-
-                    if elapsed_seconds >= timer_duration_seconds:
+                    if elapsed_seconds >= timer_duration_minutes * 60:
                         _LOGGER.info(
-                            "%s: Timer expired (elapsed %.1fs >= duration %ds). Initiating turn OFF sequence.",
-                            self.entity_id, elapsed_seconds, timer_duration_seconds
+                            "%s: Timer expired (elapsed %.1fs >= %d min). Turning OFF.",
+                            self.entity_id, elapsed_seconds, timer_duration_minutes
                         )
-                        # --- Start Timer Turn Off Sequence ---
-                        _LOGGER.debug("%s: Timer Expired: Activating OFF scene (Attempt 1).", self.entity_id)
-                        first_activation_success = await self._activate_scene(
-                            self._scene_turn_on_off, "timer expired turn OFF (1st attempt)"
-                        )
-                        if not first_activation_success:
-                             _LOGGER.warning("%s: Timer Expired: First attempt to activate OFF scene failed.", self.entity_id)
-
-                        _LOGGER.debug("%s: Timer Expired: Waiting %d seconds before checking power state.", self.entity_id, Sleep_After_Power_Off)
-                        await asyncio.sleep(Sleep_After_Power_Off)
-
-                        _LOGGER.debug("%s: Timer Expired: Checking power state after delay.", self.entity_id)
-                        power_after_delay = self.current_power_usage
-
-                        if self._power_usage_sensor and power_after_delay is not None and power_after_delay >= VOLTAGE_ON_THRESHOLD:
-                            _LOGGER.warning(
-                                "%s: Timer Expired: Heater power usage (%.2f) still high after %ds. Activating OFF scene again (Attempt 2).",
-                                self.entity_id, power_after_delay, Sleep_After_Power_Off
-                            )
-                            await self._activate_scene(self._scene_turn_on_off, "timer expired turn OFF (2nd attempt)")
-                        elif not self._power_usage_sensor:
-                             _LOGGER.warning("%s: Timer Expired: Cannot verify power state after delay (no power sensor). Assuming OFF sequence complete.", self.entity_id)
-                        else:
-                            _LOGGER.debug(
-                                "%s: Timer Expired: Heater power usage (%.2f) low or unavailable after %ds. OFF sequence complete.",
-                                self.entity_id, power_after_delay if power_after_delay is not None else -1.0, Sleep_After_Power_Off
-                            )
-
-                        _LOGGER.info("%s: Timer Expired: Setting internal state to OFF.", self.entity_id)
+                        await self._send_toggle("timer expired turn OFF")
                         self._attr_hvac_mode = HVACMode.OFF
                         self._heat_start_time = None
                         self.last_mode_change_time = datetime.now(timezone.utc)
+                        self._last_sync_reason = "timer"
                         self.async_write_ha_state()
-
-                        _LOGGER.debug("%s: Timer expiry sequence complete. Exiting monitoring loop.", self.entity_id)
+                        self._cancel_task("_verify_task")
+                        self._verify_task = self.hass.async_create_task(self._verify_off("timer OFF"))
                         break
-                        # --- End Timer Turn Off Sequence ---
 
-                # --- 2. Temperature Maintenance Check (Only if Timer Didn't Expire) ---
-                if self._attr_hvac_mode == HVACMode.HEAT:
-                    current_temp = self.current_temperature
-                    target_temp = self._attr_target_temperature
-
-                    if current_temp is not None and target_temp is not None:
-                        difference = current_temp - target_temp
-                        power = self.current_power_usage
-
-                        _LOGGER.debug(
-                            "%s: [Monitor] Current: %.1f, Target: %.1f, Diff: %.1f, Power: %s",
-                            self.entity_id, current_temp, target_temp, difference, power
-                        )
-
-                        if self._power_usage_sensor and power is not None:
-                            # Temp too low AND heater seems OFF -> Try turning UP
-                            if difference < -1 and power <= VOLTAGE_ON_THRESHOLD:
-                                _LOGGER.debug("%s: [Monitor] Temp too low (%.1f) & power low. Activating UP scene.", self.entity_id, difference)
-                                if await self._activate_scene(self._temperature_up_scene, "monitor temp up"):
-                                    await asyncio.sleep(SCENE_ACTIVATION_DELAY)
-                                    await self._activate_scene(self._temperature_up_scene, "monitor temp up 2")
-
-                            # Temp too high AND heater seems ON -> Try turning DOWN
-                            elif difference > 1 and power >= VOLTAGE_ON_THRESHOLD:
-                                _LOGGER.debug("%s: [Monitor] Temp too high (%.1f) & power high. Activating DOWN scene.", self.entity_id, difference)
-                                if await self._activate_scene(self._temperature_down_scene, "monitor temp down"):
-                                    await asyncio.sleep(SCENE_ACTIVATION_DELAY)
-                                    await self._activate_scene(self._temperature_down_scene, "monitor temp down 2")
-                            else:
-                                _LOGGER.debug("%s: [Monitor] Temp/Power state OK (Diff: %.1f, Power: %.1f).", self.entity_id, difference, power)
-                        elif not self._power_usage_sensor:
-                            _LOGGER.debug("%s: [Monitor] Power sensor not configured. Skipping temperature maintenance.", self.entity_id)
-                        else: # power is None
-                            _LOGGER.debug("%s: [Monitor] Power sensor unavailable. Skipping temperature maintenance check.", self.entity_id)
-                    else:
-                        _LOGGER.debug("%s: [Monitor] Current or target temperature unavailable.", self.entity_id)
-
-                # --- Wait for next interval ---
-                if self._attr_hvac_mode == HVACMode.HEAT:
-                    _LOGGER.debug("%s: [Monitor] Sleeping for %d seconds.", self.entity_id, MONITORING_INTERVAL_SECONDS)
-                    await asyncio.sleep(MONITORING_INTERVAL_SECONDS)
-                else:
-                    _LOGGER.debug("%s: [Monitor] Mode changed during checks. Exiting loop instead of sleeping.", self.entity_id)
+                # --- 2. Idle-Off Check: the heater was turned off outside HA ---
+                # The heater's own thermostat pauses heating for a few minutes at a
+                # time (2-7 min observed). Much longer with no heating at all means
+                # it was switched off by its own remote/button or lost power.
+                idle_minutes = self._idle_off_minutes
+                if (
+                    idle_minutes > 0
+                    and self._last_heating_seen is not None
+                    and not self._in_settle_window(now)
+                    and power is not None
+                    and not self._is_heating(power)
+                    and (now - self._last_heating_seen) >= timedelta(minutes=idle_minutes)
+                ):
+                    _LOGGER.info(
+                        "%s: No heating for %d min (power %.1f W). Heater is off; syncing to OFF without IR.",
+                        self.entity_id, idle_minutes, power,
+                    )
+                    self._sync_mode(HVACMode.OFF, "no_heating")
                     break
+
+                # --- 3. Temperature Maintenance (opt-in) ---
+                if self._temp_maintenance_enabled:
+                    await self._maintain_temperature(now, power)
+
+                await asyncio.sleep(MONITORING_INTERVAL_SECONDS)
 
         except asyncio.CancelledError:
             _LOGGER.info("%s: Monitoring task explicitly cancelled.", self.entity_id)
@@ -414,57 +497,83 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             _LOGGER.exception("%s: Unhandled exception in monitoring task: %s", self.entity_id, e)
         finally:
             _LOGGER.info("%s: Monitoring task stopped.", self.entity_id)
-            if self._monitoring_task and self._monitoring_task.done():
+            if self._monitoring_task is asyncio.current_task():
                 self._monitoring_task = None
+
+    async def _maintain_temperature(self, now, power):
+        """Press UP/DOWN when the room is far from target (only if enabled in options).
+
+        Off by default: when the target is the heater's own dial value (e.g. 43)
+        rather than a room temperature, this pressed UP every 2 minutes forever.
+        """
+        if self._last_maintenance_time and (now - self._last_maintenance_time).total_seconds() < TEMP_MAINTENANCE_INTERVAL_SECONDS:
+            return
+        current_temp = self.current_temperature
+        target_temp = self._attr_target_temperature
+        if current_temp is None or target_temp is None or power is None:
+            return
+        difference = current_temp - target_temp
+        if difference < -1 and not self._is_heating(power):
+            _LOGGER.debug("%s: [Monitor] Temp too low (%.1f) & not heating. Activating UP scene.", self.entity_id, difference)
+            self._last_maintenance_time = now
+            await self._activate_scene(self._temperature_up_scene, "monitor temp up")
+        elif difference > 1 and self._is_heating(power):
+            _LOGGER.debug("%s: [Monitor] Temp too high (%.1f) & heating. Activating DOWN scene.", self.entity_id, difference)
+            self._last_maintenance_time = now
+            await self._activate_scene(self._temperature_down_scene, "monitor temp down")
 
 
     # --- Power Sensor Change Callback ---
     @callback
-    async def _async_power_sensor_changed(self, event: Event) -> None:
-        """Handle state changes of the power usage sensor to auto-turn ON."""
+    def _async_power_sensor_changed(self, event: Event) -> None:
+        """Handle power sensor updates: remember real heating, and auto-ON with a double check."""
         new_state: State | None = event.data.get("new_state")
-        entity_id = event.data.get("entity_id")
-
-        if new_state is None or new_state.state in (None, "unknown", "unavailable"):
-            _LOGGER.debug("%s: Power sensor %s changed to unavailable state: %s. Ignoring.", self.entity_id, entity_id, new_state.state if new_state else "None")
-            return
-
-        if self._attr_hvac_mode != HVACMode.OFF:
-            _LOGGER.debug("%s: Power sensor %s changed, but climate is not OFF (Mode: %s). Ignoring for auto-on.", self.entity_id, entity_id, self._attr_hvac_mode)
+        power = self._power_watts(new_state)
+        if power is None:
             return
 
         now = datetime.now(timezone.utc)
-        if self.last_mode_change_time and (now - self.last_mode_change_time) < timedelta(seconds=AUTO_ON_COOLDOWN_SECONDS):
-             _LOGGER.debug("%s: Power sensor %s changed, but mode changed recently (<%ds ago). Ignoring potential auto-on flip-back.", self.entity_id, entity_id, AUTO_ON_COOLDOWN_SECONDS)
-             return
+        if self._is_heating(power):
+            self._last_heating_seen = now
 
-        try:
-            power_usage = float(new_state.state)
-            _LOGGER.debug("%s: Power sensor %s changed to %.2f.", self.entity_id, entity_id, power_usage)
-        except (ValueError, TypeError):
-            _LOGGER.warning("%s: Power sensor %s returned non-numeric state: %s. Cannot check threshold.", self.entity_id, entity_id, new_state.state)
+        if self._attr_hvac_mode != HVACMode.OFF or not self._is_heating(power):
             return
+        if self._in_settle_window(now):
+            # Our own toggle is still landing (wind-down tail, late plug report)
+            _LOGGER.debug("%s: %.1f W within %ds of our IR command. Ignoring for auto-on.", self.entity_id, power, COMMAND_SETTLE_SECONDS)
+            return
+        if self._confirm_task and not self._confirm_task.done():
+            return
+        _LOGGER.debug("%s: %.1f W while OFF. Confirming in %ds before auto-on.", self.entity_id, power, AUTO_ON_CONFIRM_SECONDS)
+        self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
 
-        # --- Auto-ON Logic ---
-        if power_usage > VOLTAGE_ON_THRESHOLD:
-            _LOGGER.info(
-                "%s: Auto-ON condition met. Power usage %.2f > threshold %.1f while HVAC mode was OFF. Setting mode to HEAT.",
-                self.entity_id, power_usage, VOLTAGE_ON_THRESHOLD
-            )
-            # Set state to HEAT
-            self._attr_hvac_mode = HVACMode.HEAT
-            current_time = datetime.now(timezone.utc)
-            if self._heat_start_time is None: # Should be None if mode was OFF
-                 self._heat_start_time = current_time
-            self.last_mode_change_time = current_time
-            self.async_write_ha_state()
-            # Start the monitoring task
-            await self._start_monitoring_task()
-        else:
-             _LOGGER.debug("%s: Power sensor %s changed to %.2f, below threshold %.1f. No auto-on action needed.", self.entity_id, entity_id, power_usage, VOLTAGE_ON_THRESHOLD)
+    async def _confirm_auto_on(self):
+        """Second look: the heater must still be heating before we show HEAT."""
+        try:
+            await asyncio.sleep(AUTO_ON_CONFIRM_SECONDS)
+            power = self.current_power_usage
+            if (
+                self._attr_hvac_mode == HVACMode.OFF
+                and not self._in_settle_window()
+                and self._is_heating(power)
+            ):
+                _LOGGER.info(
+                    "%s: Auto-ON confirmed: %.1f W >= %.0f W twice, %ds apart. Setting mode to HEAT.",
+                    self.entity_id, power, self._power_threshold, AUTO_ON_CONFIRM_SECONDS,
+                )
+                self._sync_mode(HVACMode.HEAT, "heating_detected")
+            else:
+                _LOGGER.debug("%s: Auto-ON not confirmed (power %s).", self.entity_id, power)
+        except asyncio.CancelledError:
+            pass
 
 
-    # --- Scene Activation Helper ---
+    # --- Scene Activation Helpers ---
+    async def _send_toggle(self, action_description):
+        """Send the on/off IR toggle and start the settle window."""
+        self._last_command_time = datetime.now(timezone.utc)
+        return await self._activate_scene(self._scene_turn_on_off, action_description)
+
     async def _activate_scene(self, scene_entity_id, action_description=""):
         """Helper to call the scene.turn_on service."""
         if not scene_entity_id:
@@ -496,18 +605,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
         # --- State Restoration ---
         last_state = await self.async_get_last_state() # From RestoreEntity
-        restored_mode = None
         restored_temp = None
 
         if last_state is not None:
             _LOGGER.debug("%s: Found last state: %s", self.entity_id, last_state)
-            # Restore HVAC mode
-            if last_state.state in self._attr_hvac_modes:
-                restored_mode = last_state.state
-                _LOGGER.debug("%s: Restored hvac_mode: %s", self.entity_id, restored_mode)
-            else:
-                 _LOGGER.warning("%s: Invalid hvac_mode '%s' found in last state.", self.entity_id, last_state.state)
-
             # Restore target temperature
             if ATTR_TEMPERATURE in last_state.attributes:
                 temp_from_state = last_state.attributes[ATTR_TEMPERATURE]
@@ -525,19 +626,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         else:
             _LOGGER.debug("%s: No last state found.", self.entity_id)
 
-        # --- Apply Restored State or Defaults ---
-        self._attr_hvac_mode = restored_mode if restored_mode is not None else HVACMode.OFF
+        # The mode is never restored: after a restart the plug decides (auto-ON below)
         self._attr_hvac_mode = HVACMode.OFF
         self._attr_target_temperature = restored_temp if restored_temp is not None else self._default_temp # Use stored default
 
         _LOGGER.debug("%s: Final initial state - Mode: %s, Target Temp: %.1f",
                       self.entity_id, self._attr_hvac_mode, self._attr_target_temperature)
-
-        # If restored to HEAT mode, reset the start time
-        if self._attr_hvac_mode == HVACMode.HEAT:
-             self._heat_start_time = datetime.now(timezone.utc)
-             _LOGGER.debug("%s: Mode is HEAT after restoration/init, setting heat_start_time.", self.entity_id)
-
 
         # --- Setup Listeners ---
         self._options_listener_remove = self.config_entry.add_update_listener(
@@ -550,15 +644,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             self._power_sensor_listener_remove = async_track_state_change_event(
                 self.hass, [self._power_usage_sensor], self._async_power_sensor_changed
             )
+            # Heater already heating when HA starts: show it (same double check)
+            if self._is_heating(self.current_power_usage):
+                self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
         else:
             _LOGGER.debug("%s: Power sensor not configured, skipping auto-on listener setup.", self.entity_id)
-
-        # --- Start Monitoring Task if Needed ---
-        if self._attr_hvac_mode == HVACMode.HEAT:
-            if not self._monitoring_task or self._monitoring_task.done():
-               _LOGGER.info("%s: Starting monitoring task on add_to_hass as final mode is HEAT.", self.entity_id)
-               # Use create_task to avoid blocking setup if task takes time to start
-               self.hass.create_task(self._start_monitoring_task())
 
 
     async def async_will_remove_from_hass(self) -> None:
@@ -576,7 +666,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             _LOGGER.debug("%s: Removed power sensor listener.", self.entity_id)
             self._power_sensor_listener_remove = None
 
-        # Stop monitoring task
+        # Stop background tasks
+        self._cancel_task("_verify_task")
+        self._cancel_task("_confirm_task")
         await self._stop_monitoring_task()
         # Call super last
         await super().async_will_remove_from_hass()
