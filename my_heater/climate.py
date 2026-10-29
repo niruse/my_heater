@@ -219,6 +219,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             "power_threshold": self._power_threshold,
             "last_heating_seen": self._last_heating_seen.isoformat() if self._last_heating_seen else None,
             "rest_peak_temperature": self._rest_peak_temp,
+            # Saved with the state, so a restart resumes the timer instead of restarting it
+            "heat_started": self._heat_start_time.isoformat() if self._heat_start_time else None,
             "last_command": self._last_command_time.isoformat() if self._last_command_time else None,
             "last_sync_reason": self._last_sync_reason,
         }
@@ -666,7 +668,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         else:
             _LOGGER.debug("%s: No last state found.", self.entity_id)
 
-        # The mode is never restored: after a restart the plug decides (auto-ON below)
+        # The mode starts OFF; a heater that was in HEAT is resumed below, once the
+        # power listener is in place (see _restore_heat).
         self._attr_hvac_mode = HVACMode.OFF
         self._attr_target_temperature = restored_temp if restored_temp is not None else self._default_temp # Use stored default
 
@@ -684,12 +687,58 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             self._power_sensor_listener_remove = async_track_state_change_event(
                 self.hass, [self._power_usage_sensor], self._async_power_sensor_changed
             )
+            if last_state is not None and last_state.state == HVACMode.HEAT:
+                self._restore_heat(last_state)
             # Heater already heating when HA starts: show it (same double check)
-            if self._is_heating(self.current_power_usage):
+            if self._attr_hvac_mode == HVACMode.OFF and self._is_heating(self.current_power_usage):
                 self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
         else:
             _LOGGER.debug("%s: Power sensor not configured, skipping auto-on listener setup.", self.entity_id)
 
+
+    def _restore_heat(self, last_state) -> None:
+        """Resume HEAT after a restart, keeping the timer start and the room peak.
+
+        Before 2026-10-29 every restart showed the heater OFF: a resting heater (0 W)
+        stayed OFF until it reheated (up to ~20 min) and the timer then started from
+        zero, so each restart could add 20 + 30 min. Now the saved start time and room
+        peak come back with the state. If the room already fell ROOM_DROP_OFF below the
+        saved peak with no heating, the heater was switched off while HA was down:
+        it stays OFF and nothing is sent. A timer that ran out meanwhile fires on the
+        first monitor pass.
+        """
+        attrs = last_state.attributes
+        now = datetime.now(timezone.utc)
+
+        def when(key):
+            try:
+                return datetime.fromisoformat(attrs[key]) if attrs.get(key) else None
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            peak = float(attrs["rest_peak_temperature"]) if attrs.get("rest_peak_temperature") is not None else None
+        except (TypeError, ValueError):
+            peak = None
+        seen = when("last_heating_seen")
+        if seen is not None and now - seen > timedelta(minutes=IDLE_OFF_WITH_ROOM_TEMP_MINUTES):
+            _LOGGER.info("%s: Was HEAT before restart but no heating since %s. Staying OFF.", self.entity_id, seen)
+            return
+        power, room = self.current_power_usage, self.current_temperature
+        if (peak is not None and room is not None and power is not None
+                and not self._is_heating(power) and room <= peak - ROOM_DROP_OFF):
+            _LOGGER.info("%s: Room %.1f is %.1f below its %.1f peak since before the restart. "
+                         "Switched off while HA was down; staying OFF.", self.entity_id, room, peak - room, peak)
+            self._last_sync_reason = "room_cooling"
+            return
+        self._attr_hvac_mode = HVACMode.HEAT
+        self._heat_start_time = when("heat_started") or now
+        self._last_heating_seen = seen or now
+        self._rest_peak_temp = peak
+        self.last_mode_change_time = now
+        self._last_sync_reason = "restored"
+        _LOGGER.info("%s: Restored HEAT (started %s).", self.entity_id, self._heat_start_time)
+        self.hass.async_create_task(self._start_monitoring_task())
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
