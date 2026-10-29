@@ -10,4 +10,4 @@ CONF_TEMP_MAINTENANCE = "temperature_maintenance"
 # wind-down tail the heater draws for 20-35 s after it switches off.
 DEFAULT_POWER_THRESHOLD = 100
 # Minutes in HEAT with no heating before the heater is treated as switched off.
-DEFAULT_IDLE_OFF_MINUTES = 15
+DEFAULT_IDLE_OFF_MINUTES = 45   # thermostat rests read 0 W, same as off; seen up to 20 min

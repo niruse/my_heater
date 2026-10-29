@@ -466,9 +466,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         break
 
                 # --- 2. Idle-Off Check: the heater was turned off outside HA ---
-                # The heater's own thermostat pauses heating for a few minutes at a
-                # time (2-7 min observed). Much longer with no heating at all means
-                # it was switched off by its own remote/button or lost power.
+                # The heater's own thermostat pauses heating, and the plug reads 0 W
+                # then, exactly as when the heater is off. The pauses grow as the room
+                # warms: 9, 15, 19, 20, 20 min on 2026-10-28 (bathroom). The old 15 min
+                # fired inside them and every re-detection restarted the timer, so the
+                # 30-min timer never turned the heater off. Much longer than the
+                # longest pause means it was switched off outside HA or lost power.
                 idle_minutes = self._idle_off_minutes
                 if (
                     idle_minutes > 0

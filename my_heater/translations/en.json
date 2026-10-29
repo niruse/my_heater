@@ -24,7 +24,7 @@
           },
           "data_description": {
             "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",
-            "idle_off_minutes": "The heater pauses on its own thermostat for a few minutes. Longer than this with no heating means it was switched off outside Home Assistant."
+            "idle_off_minutes": "The heater pauses on its own thermostat for up to ~20 minutes, and the plug reads 0 W then. Longer than this with no heating means it was switched off outside Home Assistant."
           }
         }
       }
