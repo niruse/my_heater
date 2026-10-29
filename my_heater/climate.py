@@ -30,6 +30,14 @@ _LOGGER = logging.getLogger(__name__)
 
 # --- Configuration Constants ---
 MONITORING_INTERVAL_SECONDS = 30   # How often to check timer / idle / temp in HEAT mode
+# Off or just resting? The heater stops on its own thermostat once the room is warm,
+# and the plug reads 0 W then, exactly as when it is off. The room temperature tells
+# them apart (bathroom, 2026-10-28): resting, it reheats once the room falls only
+# 0.1-0.4 deg below its peak; switched off, the room kept falling (32.2 -> 28.2 in
+# 2.5 h). So: no heating and the room ROOM_DROP_OFF below its peak since the last
+# heating = off. With a room reading, the time-only idle-off waits this long instead.
+ROOM_DROP_OFF = 1.0
+IDLE_OFF_WITH_ROOM_TEMP_MINUTES = 180
 TEMP_MAINTENANCE_INTERVAL_SECONDS = 120  # Min gap between temp-maintenance IR presses
 SCENE_ACTIVATION_DELAY = 1.0     # Short delay after activating some scenes
 # After WE send an IR command the heater needs time to react and the plug needs time
@@ -115,6 +123,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self.last_mode_change_time = None   # Track last mode change for cooldowns
         self._last_command_time = None      # Last time WE sent the on/off IR toggle
         self._last_heating_seen = None      # Last time the plug showed real heating
+        self._rest_peak_temp = None         # Warmest room reading since heating last stopped
         self._last_maintenance_time = None  # Last temp-maintenance IR press
         self._last_sync_reason = None       # Why the mode last changed without a user command
         self._power_sensor_listener_remove = None # To unsubscribe from power sensor updates
@@ -209,6 +218,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         return {
             "power_threshold": self._power_threshold,
             "last_heating_seen": self._last_heating_seen.isoformat() if self._last_heating_seen else None,
+            "rest_peak_temperature": self._rest_peak_temp,
             "last_command": self._last_command_time.isoformat() if self._last_command_time else None,
             "last_sync_reason": self._last_sync_reason,
         }
@@ -257,6 +267,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             now = datetime.now(timezone.utc)
             self._attr_hvac_mode = HVACMode.HEAT
             self._heat_start_time = now # Record start time for timer
+            self._rest_peak_temp = None  # a peak from an earlier session must not count
             self._last_heating_seen = now # Idle-off counts from here
             self.last_mode_change_time = now # Record mode change time
             self._last_sync_reason = None
@@ -420,6 +431,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._attr_hvac_mode = hvac_mode
         self.last_mode_change_time = now
         self._last_sync_reason = reason
+        self._rest_peak_temp = None
         if hvac_mode == HVACMode.HEAT:
             if self._heat_start_time is None:
                 self._heat_start_time = now
@@ -443,8 +455,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
                 now = datetime.now(timezone.utc)
                 power = self.current_power_usage
+                room = self.current_temperature
                 if self._is_heating(power):
                     self._last_heating_seen = now
+                    self._rest_peak_temp = None
+                elif room is not None and power is not None and not self._in_settle_window(now):
+                    self._rest_peak_temp = room if self._rest_peak_temp is None else max(self._rest_peak_temp, room)
 
                 # --- 1. Timer Check ---
                 timer_duration_minutes = self._timer_duration_minutes
@@ -465,7 +481,24 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         self._verify_task = self.hass.async_create_task(self._verify_off("timer OFF"))
                         break
 
-                # --- 2. Idle-Off Check: the heater was turned off outside HA ---
+                # --- 2. Room-cooling Check: switched off outside HA (see ROOM_DROP_OFF) ---
+                if (
+                    self._rest_peak_temp is not None
+                    and room is not None
+                    and power is not None
+                    and not self._is_heating(power)
+                    and not self._in_settle_window(now)
+                    and room <= self._rest_peak_temp - ROOM_DROP_OFF
+                ):
+                    _LOGGER.info(
+                        "%s: Room %.1f is %.1f below its %.1f peak with no heating: a resting heater "
+                        "would have reheated. Heater is off; syncing to OFF without IR.",
+                        self.entity_id, room, self._rest_peak_temp - room, self._rest_peak_temp,
+                    )
+                    self._sync_mode(HVACMode.OFF, "room_cooling")
+                    break
+
+                # --- 3. Idle-Off Check (fallback): no heating for a long time ---
                 # The heater's own thermostat pauses heating, and the plug reads 0 W
                 # then, exactly as when the heater is off. The pauses grow as the room
                 # warms: 9, 15, 19, 20, 20 min on 2026-10-28 (bathroom). The old 15 min
@@ -473,6 +506,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 # 30-min timer never turned the heater off. Much longer than the
                 # longest pause means it was switched off outside HA or lost power.
                 idle_minutes = self._idle_off_minutes
+                if idle_minutes > 0 and room is not None:
+                    # The room rule decides; time alone only when the room stays flat
+                    idle_minutes = max(idle_minutes, IDLE_OFF_WITH_ROOM_TEMP_MINUTES)
                 if (
                     idle_minutes > 0
                     and self._last_heating_seen is not None
@@ -488,7 +524,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     self._sync_mode(HVACMode.OFF, "no_heating")
                     break
 
-                # --- 3. Temperature Maintenance (opt-in) ---
+                # --- 4. Temperature Maintenance (opt-in) ---
                 if self._temp_maintenance_enabled:
                     await self._maintain_temperature(now, power)
 
@@ -538,6 +574,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         now = datetime.now(timezone.utc)
         if self._is_heating(power):
             self._last_heating_seen = now
+            self._rest_peak_temp = None
 
         if self._attr_hvac_mode != HVACMode.OFF or not self._is_heating(power):
             return
