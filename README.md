@@ -28,6 +28,7 @@ This integration was developed considering hardware like:
 * **Timer Off Failsafe:** When the timer expires, it activates the OFF scene, waits 60 seconds (`Sleep_After_Power_Off`), checks the power sensor again, and re-activates the OFF scene if power usage is still high.
 * **Basic Temperature Maintenance:** While in `HEAT` mode, periodically checks if the current temperature has drifted significantly from the target and if the power state seems wrong (e.g., temp too low but power is off, or temp too high but power is on). If so, it attempts to correct by activating the UP or DOWN temperature scenes.
 * **State Restoration:** Remembers and restores the last set target temperature and HVAC mode across Home Assistant restarts.
+* **Fan Only (optional):** Set a **Mode button** in the options (a `button` or `scene` that sends the remote's mode/speed key) and the entity also offers `fan_only`. Many heaters cycle low heat -> high heat -> fan only on that key; the integration presses it, waits ~45 s for the plug to report each step, and stops when the power shows the wanted mode (fan only = a steady 10-60 W). Switching between heat and fan on the physical remote is picked up from the plug too, and `hvac_action` shows heating / idle / fan. The off timer covers fan only as well.
 
 ## Prerequisites
 

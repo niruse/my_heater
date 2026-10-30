@@ -1,32 +1,35 @@
 {
     "config": {
-      "step": {
-        "user": {
-          "title": "Configure My Heater",
-          "description": "Set up your heater",
-          "data": {
-            "heater_name": "Heater Name",
-            "scene_turn_on_off": "Scene to turn on/off"
-          }
+        "step": {
+            "user": {
+                "title": "Configure My Heater",
+                "description": "Set up your heater",
+                "data": {
+                    "heater_name": "Heater Name",
+                    "scene_turn_on_off": "Scene to turn on/off",
+                    "mode_button": "Mode button (optional, adds fan only)"
+                }
+            }
         }
-      }
     },
     "options": {
-      "step": {
-        "init": {
-          "title": "My Heater options",
-          "data": {
-            "timer": "Auto-off timer (minutes, 0 = off)",
-            "remember_last_temp": "Remember last temperature",
-            "power_threshold": "Heating power threshold (W)",
-            "idle_off_minutes": "Show OFF after this many minutes without heating (0 = never)",
-            "temperature_maintenance": "Press UP/DOWN automatically to hold the target"
-          },
-          "data_description": {
-            "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",
-            "idle_off_minutes": "The heater pauses on its own thermostat for up to ~20 minutes, and the plug reads 0 W then. Longer than this with no heating means it was switched off outside Home Assistant."
-          }
+        "step": {
+            "init": {
+                "title": "My Heater options",
+                "data": {
+                    "timer": "Auto-off timer (minutes, 0 = off)",
+                    "remember_last_temp": "Remember last temperature",
+                    "power_threshold": "Heating power threshold (W)",
+                    "idle_off_minutes": "Show OFF after this many minutes without heating (0 = never)",
+                    "temperature_maintenance": "Press UP/DOWN automatically to hold the target",
+                    "mode_button": "Mode button (optional, adds fan only)"
+                },
+                "data_description": {
+                    "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",
+                    "idle_off_minutes": "The heater pauses on its own thermostat for up to ~20 minutes, and the plug reads 0 W then. Longer than this with no heating means it was switched off outside Home Assistant.",
+                    "mode_button": "The remote button that steps the heater's mode (for example low heat, high heat, fan only). With it you can choose fan only; the plug tells fan (about 10-60 W, steady) from heating."
+                }
+            }
         }
-      }
     }
-  }
+}

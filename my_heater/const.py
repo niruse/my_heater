@@ -11,3 +11,6 @@ CONF_TEMP_MAINTENANCE = "temperature_maintenance"
 DEFAULT_POWER_THRESHOLD = 100
 # Minutes in HEAT with no heating before the heater is treated as switched off.
 DEFAULT_IDLE_OFF_MINUTES = 45   # thermostat rests read 0 W, same as off; seen up to 20 min
+# Optional button/scene that steps the heater's mode (low heat -> high heat -> fan
+# only -> low heat on the parents heater). Setting it adds the FAN_ONLY mode.
+CONF_MODE_BUTTON = "mode_button"

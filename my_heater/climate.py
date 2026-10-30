@@ -6,7 +6,7 @@ import logging
 
 # Core Home Assistant components
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
-from homeassistant.components.climate.const import HVACMode
+from homeassistant.components.climate.const import HVACAction, HVACMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.core import HomeAssistant, callback, Event, State # Added State for type hinting
@@ -22,6 +22,7 @@ from .const import (
     CONF_POWER_THRESHOLD,
     CONF_IDLE_OFF_MINUTES,
     CONF_TEMP_MAINTENANCE,
+    CONF_MODE_BUTTON,
     DEFAULT_POWER_THRESHOLD,
     DEFAULT_IDLE_OFF_MINUTES,
 )
@@ -50,6 +51,17 @@ AUTO_ON_CONFIRM_SECONDS = 20
 # OFF double check: after the OFF toggle, power must be below the threshold by then.
 OFF_VERIFY_SECONDS = 90
 OFF_VERIFY_RETRIES = 1           # Extra OFF toggles if the heater is still drawing power
+# Fan-only mode (parents heater, 2026-10-30): the remote's bars button cycles
+# low heat (~950 W) -> high heat (~1860 W) -> fan only (~22 W) -> low heat, and the
+# plug shows each press 18-30 s later. The fan alone draws about what the wind-down
+# tail after OFF does (~21 W), but it holds: the tail is gone (and reported gone)
+# within ~70 s, so a fan-band reading held FAN_CONFIRM_SECONDS is fan mode.
+FAN_MIN_WATTS = 10
+FAN_MAX_WATTS = 60
+FAN_CONFIRM_SECONDS = 120
+MODE_STEP_SECONDS = 45           # wait after each mode press before reading the plug
+MODE_MAX_PRESSES = 3             # one full turn of the cycle
+FAN_STOPPED_PASSES = 2           # monitor passes at ~0 W before FAN_ONLY shows OFF
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -108,6 +120,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         # Store min/max/default temps from config
         self._attr_min_temp = self.config_entry.data["min_temp"]
         self._attr_max_temp = self.config_entry.data["max_temp"]
+        # Optional mode button: with it the heater also offers fan only
+        self._mode_button = self._option(CONF_MODE_BUTTON, None)
+        self._attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT] + ([HVACMode.FAN_ONLY] if self._mode_button else [])
         self._default_temp = self.config_entry.data["default_temp"] # Store default separately
 
         # --- Entity State (initialized here, potentially overridden by restoration) ---
@@ -118,6 +133,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._monitoring_task = None        # Holds the asyncio task for monitoring
         self._verify_task = None            # OFF double-check after an OFF toggle
         self._confirm_task = None           # Auto-ON double-check after a high reading
+        self._mode_task = None              # Presses the mode button until the plug agrees
+        self._fan_confirm_task = None       # Fan-mode double-check after a fan-band reading
+        self._fan_zero_passes = 0           # Monitor passes at ~0 W while in FAN_ONLY
         self._heat_start_time = None        # When heating started (for timer)
         self._options_listener_remove = None # To unsubscribe from options updates
         self.last_mode_change_time = None   # Track last mode change for cooldowns
@@ -200,12 +218,32 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         """True only for a reading that proves the heating element is on."""
         return power is not None and power >= self._power_threshold
 
+    def _is_fan(self, power) -> bool:
+        """True for a reading in the fan-only band (only with a mode button)."""
+        return bool(self._mode_button) and power is not None and FAN_MIN_WATTS <= power <= FAN_MAX_WATTS
+
+    def _stepping_mode(self) -> bool:
+        """True while we are pressing the mode button towards a target mode."""
+        return self._mode_task is not None and not self._mode_task.done()
+
     def _in_settle_window(self, now=None) -> bool:
         """True while the heater may still be reacting to our last IR toggle."""
         if self._last_command_time is None:
             return False
         now = now or datetime.now(timezone.utc)
         return (now - self._last_command_time).total_seconds() < COMMAND_SETTLE_SECONDS
+
+    @property
+    def hvac_action(self):
+        """What the heater is doing now, read from the plug."""
+        if self._attr_hvac_mode == HVACMode.OFF:
+            return HVACAction.OFF
+        power = self.current_power_usage
+        if self._is_heating(power):
+            return HVACAction.HEATING
+        if self._attr_hvac_mode == HVACMode.FAN_ONLY:
+            return HVACAction.FAN
+        return HVACAction.IDLE
 
     @property
     def target_temperature_step(self):
@@ -242,6 +280,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         await self._stop_monitoring_task()
         self._cancel_task("_verify_task")
         self._cancel_task("_confirm_task")
+        self._cancel_task("_mode_task")
+        self._cancel_task("_fan_confirm_task")
         scene_activated = False
 
         if hvac_mode == HVACMode.HEAT:
@@ -257,8 +297,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             power = self.current_power_usage
             _LOGGER.debug("%s: Checking power usage for HEAT mode switch: value=%s, threshold=%s", self.entity_id, power, self._power_threshold)
 
+            # Already on in fan only: the toggle would switch it OFF, step the mode instead
+            if current_mode == HVACMode.FAN_ONLY:
+                 _LOGGER.debug("%s: In FAN_ONLY. Stepping the mode to heat, no toggle.", self.entity_id)
             # Send the toggle unless the plug proves the heater is already heating
-            if self._is_heating(power):
+            elif self._is_heating(power):
                  _LOGGER.debug("%s: Power usage (%.2f) >= threshold (%s). Assuming ON. Skipping scene activation.", self.entity_id, power, self._power_threshold)
             else:
                  _LOGGER.debug("%s: Power usage low/unknown. Activating ON/OFF scene for HEAT.", self.entity_id)
@@ -268,12 +311,17 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             # Set internal state and start monitoring
             now = datetime.now(timezone.utc)
             self._attr_hvac_mode = HVACMode.HEAT
-            self._heat_start_time = now # Record start time for timer
+            if current_mode != HVACMode.FAN_ONLY or self._heat_start_time is None:
+                self._heat_start_time = now # Record start time for timer (fan -> heat keeps it)
             self._rest_peak_temp = None  # a peak from an earlier session must not count
             self._last_heating_seen = now # Idle-off counts from here
             self.last_mode_change_time = now # Record mode change time
             self._last_sync_reason = None
             await self._start_monitoring_task()
+            if self._mode_button and (current_mode == HVACMode.FAN_ONLY or scene_activated):
+                # Switched on, the heater resumes its last mode, which may be fan only
+                self._mode_task = self.hass.async_create_task(
+                    self._step_mode_to(HVACMode.HEAT, wait_first=scene_activated))
             _LOGGER.info("%s: Set HVAC mode to HEAT. Monitoring task started. Scene activated: %s", self.entity_id, scene_activated)
 
         elif hvac_mode == HVACMode.OFF:
@@ -286,6 +334,23 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             # Double check in the background that the heater really stopped
             self._verify_task = self.hass.async_create_task(self._verify_off("manual OFF"))
             _LOGGER.info("%s: Set HVAC mode to OFF. OFF verification scheduled. Scene activated: %s", self.entity_id, scene_activated)
+
+        elif hvac_mode == HVACMode.FAN_ONLY and self._mode_button:
+            power = self.current_power_usage
+            switched_on = False
+            if current_mode == HVACMode.OFF and not self._is_heating(power) and not self._is_fan(power):
+                switched_on = await self._send_toggle("turn ON for FAN")
+            now = datetime.now(timezone.utc)
+            self._attr_hvac_mode = HVACMode.FAN_ONLY
+            if self._heat_start_time is None:
+                self._heat_start_time = now # The timer covers fan only too
+            self.last_mode_change_time = now
+            self._last_sync_reason = None
+            self._fan_zero_passes = 0
+            self._mode_task = self.hass.async_create_task(
+                self._step_mode_to(HVACMode.FAN_ONLY, wait_first=switched_on))
+            await self._start_monitoring_task()
+            _LOGGER.info("%s: Set HVAC mode to FAN_ONLY. Toggle sent: %s", self.entity_id, switched_on)
 
         else:
              _LOGGER.warning("%s: Unsupported HVAC mode requested: %s.", self.entity_id, hvac_mode)
@@ -407,7 +472,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 if self._attr_hvac_mode != HVACMode.OFF:
                     return
                 power = self.current_power_usage
-                if not self._is_heating(power):
+                if not self._is_heating(power) and not self._is_fan(power):
                     _LOGGER.debug("%s: OFF verified after %s (power %s).", self.entity_id, reason, power)
                     return
                 if attempt < OFF_VERIFY_RETRIES:
@@ -416,12 +481,13 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         self.entity_id, power, OFF_VERIFY_SECONDS, reason,
                     )
                     await self._send_toggle(f"{reason} retry {attempt + 1}")
-            # Still heating after the retries: tell the truth instead of showing OFF
+            # Still on after the retries: tell the truth instead of showing OFF
+            still = HVACMode.FAN_ONLY if self._is_fan(power) else HVACMode.HEAT
             _LOGGER.error(
-                "%s: Heater still drawing %.1f W after %d OFF attempts. Showing HEAT.",
-                self.entity_id, power, OFF_VERIFY_RETRIES + 1,
+                "%s: Heater still drawing %.1f W after %d OFF attempts. Showing %s.",
+                self.entity_id, power, OFF_VERIFY_RETRIES + 1, still,
             )
-            self._sync_mode(HVACMode.HEAT, "off_failed")
+            self._sync_mode(still, "off_failed")
         except asyncio.CancelledError:
             pass
 
@@ -434,10 +500,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self.last_mode_change_time = now
         self._last_sync_reason = reason
         self._rest_peak_temp = None
-        if hvac_mode == HVACMode.HEAT:
+        self._fan_zero_passes = 0
+        if hvac_mode in (HVACMode.HEAT, HVACMode.FAN_ONLY):
             if self._heat_start_time is None:
                 self._heat_start_time = now
-            self._last_heating_seen = now
+            if hvac_mode == HVACMode.HEAT:
+                self._last_heating_seen = now
             self.hass.async_create_task(self._start_monitoring_task())
         else:
             self._heat_start_time = None
@@ -451,9 +519,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         _LOGGER.info("Monitoring task started for %s.", self.entity_id)
         try:
             while True:
-                if self._attr_hvac_mode != HVACMode.HEAT:
-                    _LOGGER.info("%s: HVAC mode is no longer HEAT (%s). Stopping monitoring task.", self.entity_id, self._attr_hvac_mode)
+                if self._attr_hvac_mode not in (HVACMode.HEAT, HVACMode.FAN_ONLY):
+                    _LOGGER.info("%s: HVAC mode is now %s. Stopping monitoring task.", self.entity_id, self._attr_hvac_mode)
                     break
+                fan_mode = self._attr_hvac_mode == HVACMode.FAN_ONLY
 
                 now = datetime.now(timezone.utc)
                 power = self.current_power_usage
@@ -461,7 +530,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 if self._is_heating(power):
                     self._last_heating_seen = now
                     self._rest_peak_temp = None
-                elif room is not None and power is not None and not self._in_settle_window(now):
+                elif (room is not None and power is not None and not fan_mode
+                      and not self._is_fan(power) and not self._in_settle_window(now)):
                     self._rest_peak_temp = room if self._rest_peak_temp is None else max(self._rest_peak_temp, room)
 
                 # --- 1. Timer Check ---
@@ -483,12 +553,28 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         self._verify_task = self.hass.async_create_task(self._verify_off("timer OFF"))
                         break
 
+                # --- 1b. Fan only: the fan never rests, ~0 W means it was switched off ---
+                if fan_mode:
+                    if (power is not None and power < FAN_MIN_WATTS
+                            and not self._in_settle_window(now) and not self._stepping_mode()):
+                        self._fan_zero_passes += 1
+                        if self._fan_zero_passes >= FAN_STOPPED_PASSES:
+                            _LOGGER.info("%s: FAN_ONLY but %.1f W for %d checks. Heater is off; syncing to OFF without IR.",
+                                         self.entity_id, power, self._fan_zero_passes)
+                            self._sync_mode(HVACMode.OFF, "fan_stopped")
+                            break
+                    else:
+                        self._fan_zero_passes = 0
+                    await asyncio.sleep(MONITORING_INTERVAL_SECONDS)
+                    continue
+
                 # --- 2. Room-cooling Check: switched off outside HA (see ROOM_DROP_OFF) ---
                 if (
                     self._rest_peak_temp is not None
                     and room is not None
                     and power is not None
                     and not self._is_heating(power)
+                    and not self._is_fan(power)
                     and not self._in_settle_window(now)
                     and room <= self._rest_peak_temp - ROOM_DROP_OFF
                 ):
@@ -517,6 +603,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     and not self._in_settle_window(now)
                     and power is not None
                     and not self._is_heating(power)
+                    and not self._is_fan(power)
                     and (now - self._last_heating_seen) >= timedelta(minutes=idle_minutes)
                 ):
                     _LOGGER.info(
@@ -577,8 +664,20 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         if self._is_heating(power):
             self._last_heating_seen = now
             self._rest_peak_temp = None
+        if self._attr_hvac_mode != HVACMode.OFF:
+            self.async_write_ha_state()  # hvac_action follows the plug
 
-        if self._attr_hvac_mode != HVACMode.OFF or not self._is_heating(power):
+        # Fan only switched on or chosen on the remote: confirm it holds
+        if self._is_fan(power):
+            if (self._attr_hvac_mode != HVACMode.FAN_ONLY and not self._stepping_mode()
+                    and not (self._fan_confirm_task and not self._fan_confirm_task.done())):
+                self._fan_confirm_task = self.hass.async_create_task(self._confirm_fan())
+        else:
+            self._cancel_task("_fan_confirm_task")
+
+        if self._attr_hvac_mode not in (HVACMode.OFF, HVACMode.FAN_ONLY) or not self._is_heating(power):
+            return
+        if self._stepping_mode():
             return
         if self._in_settle_window(now):
             # Our own toggle is still landing (wind-down tail, late plug report)
@@ -595,8 +694,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             await asyncio.sleep(AUTO_ON_CONFIRM_SECONDS)
             power = self.current_power_usage
             if (
-                self._attr_hvac_mode == HVACMode.OFF
+                self._attr_hvac_mode in (HVACMode.OFF, HVACMode.FAN_ONLY)
                 and not self._in_settle_window()
+                and not self._stepping_mode()
                 and self._is_heating(power)
             ):
                 _LOGGER.info(
@@ -608,6 +708,69 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 _LOGGER.debug("%s: Auto-ON not confirmed (power %s).", self.entity_id, power)
         except asyncio.CancelledError:
             pass
+
+
+    async def _confirm_fan(self):
+        """A fan-band reading held FAN_CONFIRM_SECONDS (longer than the OFF tail) is fan only."""
+        try:
+            await asyncio.sleep(FAN_CONFIRM_SECONDS)
+            power = self.current_power_usage
+            if (
+                self._attr_hvac_mode != HVACMode.FAN_ONLY
+                and self._is_fan(power)
+                and not self._in_settle_window()
+                and not self._stepping_mode()
+            ):
+                _LOGGER.info("%s: %.1f W held %ds: fan only. Setting mode to FAN_ONLY.",
+                             self.entity_id, power, FAN_CONFIRM_SECONDS)
+                self._sync_mode(HVACMode.FAN_ONLY, "fan_detected")
+        except asyncio.CancelledError:
+            pass
+
+    async def _step_mode_to(self, target, wait_first=False):
+        """Press the mode button until the plug shows `target`.
+
+        Fan only is the fan band; heat is anything else (it may be resting at 0 W).
+        The plug shows a press 18-30 s late, so each press waits MODE_STEP_SECONDS
+        before reading; pressing faster would skip past the wanted mode.
+        """
+        try:
+            if wait_first:
+                await asyncio.sleep(MODE_STEP_SECONDS)  # the ON toggle lands first
+            for press in range(MODE_MAX_PRESSES + 1):
+                if self._attr_hvac_mode != target:
+                    return
+                power = self.current_power_usage
+                if power is None:
+                    return
+                if self._is_fan(power) == (target == HVACMode.FAN_ONLY):
+                    _LOGGER.info("%s: Mode is %s (%.1f W) after %d press(es).", self.entity_id, target, power, press)
+                    return
+                if press == MODE_MAX_PRESSES:
+                    _LOGGER.warning("%s: Still %.1f W after %d mode presses; %s not reached.",
+                                    self.entity_id, power, press, target)
+                    return
+                await self._press_mode(f"step to {target} ({press + 1})")
+                await asyncio.sleep(MODE_STEP_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    async def _press_mode(self, action_description):
+        """Press the mode button (button.press, or scene.turn_on for a scene)."""
+        self._last_command_time = datetime.now(timezone.utc)
+        domain = self._mode_button.split(".", 1)[0]
+        try:
+            await self.hass.services.async_call(
+                domain=domain,
+                service="press" if domain == "button" else "turn_on",
+                service_data={"entity_id": self._mode_button},
+                blocking=True,
+            )
+            _LOGGER.debug("%s: Pressed mode button %s: %s", self.entity_id, self._mode_button, action_description)
+            return True
+        except Exception as e:
+            _LOGGER.error("%s: Error pressing mode button %s: %s", self.entity_id, self._mode_button, e)
+            return False
 
 
     # --- Scene Activation Helpers ---
@@ -689,6 +852,15 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             )
             if last_state is not None and last_state.state == HVACMode.HEAT:
                 self._restore_heat(last_state)
+            elif last_state is not None and last_state.state == HVACMode.FAN_ONLY and self._is_fan(self.current_power_usage):
+                # The fan never rests: still in the fan band means still in fan only
+                try:
+                    self._heat_start_time = datetime.fromisoformat(last_state.attributes["heat_started"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                self._sync_mode(HVACMode.FAN_ONLY, "restored")
+            elif self._attr_hvac_mode == HVACMode.OFF and self._is_fan(self.current_power_usage):
+                self._fan_confirm_task = self.hass.async_create_task(self._confirm_fan())
             # Heater already heating when HA starts: show it (same double check)
             if self._attr_hvac_mode == HVACMode.OFF and self._is_heating(self.current_power_usage):
                 self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
@@ -758,6 +930,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         # Stop background tasks
         self._cancel_task("_verify_task")
         self._cancel_task("_confirm_task")
+        self._cancel_task("_mode_task")
+        self._cancel_task("_fan_confirm_task")
         await self._stop_monitoring_task()
         # Call super last
         await super().async_will_remove_from_hass()

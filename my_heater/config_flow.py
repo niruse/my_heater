@@ -12,6 +12,7 @@ from .const import (
     CONF_POWER_THRESHOLD,
     CONF_IDLE_OFF_MINUTES,
     CONF_TEMP_MAINTENANCE,
+    CONF_MODE_BUTTON,
     DEFAULT_POWER_THRESHOLD,
     DEFAULT_IDLE_OFF_MINUTES,
 )
@@ -99,6 +100,12 @@ class MyHeaterOptionsFlowHandler(config_entries.OptionsFlow):
                     default=self._current(CONF_TEMP_MAINTENANCE, False)
                 ): bool,
 
+                # Button/scene that steps low heat -> high heat -> fan only (adds FAN_ONLY)
+                vol.Optional(
+                    CONF_MODE_BUTTON,
+                    description={"suggested_value": self._current(CONF_MODE_BUTTON, None)},
+                ): selector({"entity": {"domain": ["button", "scene"]}}),
+
                 # Add other options here in the future
             }
         )
@@ -153,6 +160,7 @@ class MyHeaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("power_usage"): selector({"entity": {"domain": "sensor"}}),
                 vol.Required("timer", default=30): vol.All(vol.Coerce(int), Range(min=0)),
                 vol.Optional("remember_last_temp", default=False): bool, # Stays Optional here
+                vol.Optional(CONF_MODE_BUTTON): selector({"entity": {"domain": ["button", "scene"]}}),
             }
         )
 
