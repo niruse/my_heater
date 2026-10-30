@@ -54,13 +54,18 @@ OFF_VERIFY_RETRIES = 1           # Extra OFF toggles if the heater is still draw
 # Fan-only mode (parents heater, 2026-10-30): the remote's bars button cycles
 # low heat (~950 W) -> high heat (~1860 W) -> fan only (~22 W) -> low heat, and the
 # plug shows each press 18-30 s later. The fan alone draws about what the wind-down
-# tail after OFF does (~21 W), but it holds: the tail is gone (and reported gone)
-# within ~70 s, so a fan-band reading held FAN_CONFIRM_SECONDS is fan mode.
+# tail after OFF does (~21 W), but it holds: the tail lasted 11-41 s in every
+# capture (10-27/10-28), so a fan-band reading held FAN_CONFIRM_SECONDS is fan mode.
 FAN_MIN_WATTS = 10
 FAN_MAX_WATTS = 60
-FAN_CONFIRM_SECONDS = 120
+FAN_CONFIRM_SECONDS = 60
 MODE_STEP_SECONDS = 45           # wait after each mode press before reading the plug
-MODE_MAX_PRESSES = 3             # one full turn of the cycle
+# A press sometimes moves the heater two levels (the IR lands twice: 10-30, high ->
+# fan -> low within ~15 s on both bathroom heaters), so allow two full turns.
+MODE_MAX_PRESSES = 6
+# The bars key is the HOTBOX KPT-2000B power level: 1 = fan only, 2 = half heat
+# (~1 kW), 3 = full heat (~2 kW). Watts at or above this read as level 3.
+FULL_HEAT_WATTS = 1500
 FAN_STOPPED_PASSES = 2           # monitor passes at ~0 W before FAN_ONLY shows OFF
 
 async def async_setup_entry(
@@ -261,7 +266,18 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             "heat_started": self._heat_start_time.isoformat() if self._heat_start_time else None,
             "last_command": self._last_command_time.isoformat() if self._last_command_time else None,
             "last_sync_reason": self._last_sync_reason,
+            "power_level": self._power_level(self.current_power_usage),
         }
+
+    def _power_level(self, power):
+        """Bars level read from the plug: 1 fan, 2 half heat, 3 full heat (None at rest/off)."""
+        if not self._mode_button or power is None:
+            return None
+        if self._is_fan(power):
+            return 1
+        if self._is_heating(power):
+            return 3 if power >= FULL_HEAT_WATTS else 2
+        return None
 
 
     # --- Core Methods ---
@@ -710,6 +726,21 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             pass
 
 
+    async def async_update(self) -> None:
+        """Polled every minute: catch a plug reading whose change event we missed.
+
+        A full restart (10-30) brought fan only back as OFF: the plug reported after
+        the entity was set up and no fan check ever started. A steady reading sends no
+        new events, so look here as well.
+        """
+        if self._attr_hvac_mode != HVACMode.OFF or self._stepping_mode() or self._in_settle_window():
+            return
+        power = self.current_power_usage
+        if self._is_fan(power) and not (self._fan_confirm_task and not self._fan_confirm_task.done()):
+            self._fan_confirm_task = self.hass.async_create_task(self._confirm_fan())
+        elif self._is_heating(power) and not (self._confirm_task and not self._confirm_task.done()):
+            self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
+
     async def _confirm_fan(self):
         """A fan-band reading held FAN_CONFIRM_SECONDS (longer than the OFF tail) is fan only."""
         try:
@@ -852,8 +883,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             )
             if last_state is not None and last_state.state == HVACMode.HEAT:
                 self._restore_heat(last_state)
-            elif last_state is not None and last_state.state == HVACMode.FAN_ONLY and self._is_fan(self.current_power_usage):
-                # The fan never rests: still in the fan band means still in fan only
+            elif (last_state is not None and last_state.state == HVACMode.FAN_ONLY and self._mode_button
+                  and (self.current_power_usage is None or self._is_fan(self.current_power_usage))):
+                # The fan never rests: still in the fan band means still in fan only. On a
+                # full restart the plug often reports after us (10-30: fan_only came back
+                # OFF), so no reading yet also resumes; the monitor shows OFF if it then reads ~0 W.
                 try:
                     self._heat_start_time = datetime.fromisoformat(last_state.attributes["heat_started"])
                 except (KeyError, TypeError, ValueError):
@@ -938,9 +972,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         _LOGGER.debug("%s: Entity removal complete.", self.entity_id)
 
 
-    @callback
-    def _async_options_updated(self, hass: HomeAssistant, entry: ConfigEntry):
-        """Handle options update from the UI."""
+    async def _async_options_updated(self, hass: HomeAssistant, entry: ConfigEntry):
+        """Handle options update from the UI.
+
+        Update listeners must be coroutines: as a plain @callback HA failed to schedule
+        it and every options save answered 500 (the entry still reloaded via __init__).
+        """
         _LOGGER.info(
             "%s: Options updated: %s. Monitoring task will use new values on next check.",
              self.entity_id, entry.options
