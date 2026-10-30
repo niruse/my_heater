@@ -100,6 +100,12 @@ class MyHeaterOptionsFlowHandler(config_entries.OptionsFlow):
                     default=self._current(CONF_TEMP_MAINTENANCE, False)
                 ): bool,
 
+                # The plug's power sensor (W or kW); must read real watts
+                vol.Required(
+                    "power_usage",
+                    default=self._current("power_usage", None),
+                ): selector({"entity": {"domain": "sensor"}}),
+
                 # Button/scene that steps low heat -> high heat -> fan only (adds FAN_ONLY)
                 vol.Optional(
                     CONF_MODE_BUTTON,

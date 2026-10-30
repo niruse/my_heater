@@ -117,7 +117,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._temperature_up_scene = self.config_entry.data["temperature_up_scene"]
         self._temperature_down_scene = self.config_entry.data["temperature_down_scene"]
 
-        self._power_usage_sensor = self.config_entry.data.get("power_usage")
+        # Options can replace it (10-30: the downstairs entry pointed at a localtuya
+        # sensor reading 10x the real watts)
+        self._power_usage_sensor = self._option("power_usage", None)
         # Basic validation (more robust check happens in async_setup_entry)
         if not self._power_usage_sensor:
              _LOGGER.warning("%s: Power sensor ID is missing in config data.", self._attr_name)
@@ -733,12 +735,15 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         the entity was set up and no fan check ever started. A steady reading sends no
         new events, so look here as well.
         """
-        if self._attr_hvac_mode != HVACMode.OFF or self._stepping_mode() or self._in_settle_window():
+        if self._stepping_mode() or self._in_settle_window():
             return
         power = self.current_power_usage
-        if self._is_fan(power) and not (self._fan_confirm_task and not self._fan_confirm_task.done()):
+        if (self._attr_hvac_mode != HVACMode.FAN_ONLY and self._is_fan(power)
+                and not (self._fan_confirm_task and not self._fan_confirm_task.done())):
+            # OFF or HEAT while the plug sits in the fan band (10-30, downstairs)
             self._fan_confirm_task = self.hass.async_create_task(self._confirm_fan())
-        elif self._is_heating(power) and not (self._confirm_task and not self._confirm_task.done()):
+        elif (self._attr_hvac_mode == HVACMode.OFF and self._is_heating(power)
+                and not (self._confirm_task and not self._confirm_task.done())):
             self._confirm_task = self.hass.async_create_task(self._confirm_auto_on())
 
     async def _confirm_fan(self):

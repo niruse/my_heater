@@ -22,12 +22,14 @@
                     "power_threshold": "Heating power threshold (W)",
                     "idle_off_minutes": "Show OFF after this many minutes without heating (0 = never)",
                     "temperature_maintenance": "Press UP/DOWN automatically to hold the target",
-                    "mode_button": "Mode button (optional, adds fan only)"
+                    "mode_button": "Mode button (optional, adds fan only)",
+                    "power_usage": "Power sensor of the heater's plug"
                 },
                 "data_description": {
                     "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",
                     "idle_off_minutes": "The heater pauses on its own thermostat for up to ~20 minutes, and the plug reads 0 W then. Longer than this with no heating means it was switched off outside Home Assistant.",
-                    "mode_button": "The remote button that steps the heater's mode (for example low heat, high heat, fan only). With it you can choose fan only; the plug tells fan (about 10-60 W, steady) from heating."
+                    "mode_button": "The remote button that steps the heater's mode (for example low heat, high heat, fan only). With it you can choose fan only; the plug tells fan (about 10-60 W, steady) from heating.",
+                    "power_usage": "Must read real watts (check it shows about 20 W on fan / 1000-2000 W heating)."
                 }
             }
         }
