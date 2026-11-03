@@ -38,6 +38,14 @@ MONITORING_INTERVAL_SECONDS = 30   # How often to check timer / idle / temp in H
 # 2.5 h). So: no heating and the room ROOM_DROP_OFF below its peak since the last
 # heating = off. With a room reading, the time-only idle-off waits this long instead.
 ROOM_DROP_OFF = 1.0
+# Longest thermostat rest (0 W while on) worth trusting: rests of 9-20 min were
+# seen on 2026-10-28. No heating for longer than this = the heater is off.
+MAX_REST_MINUTES = 25
+# On/off requests within this many seconds of our last IR command are folded into
+# one: the plug shows the result 20-30 s late, so taps arrive before anyone can
+# see the first one worked, and every extra toggle flips the heater the other way
+# (2026-11-01 21:33-21:39: 11 presses, 3 toggles in 4 s).
+COALESCE_SECONDS = 40
 IDLE_OFF_WITH_ROOM_TEMP_MINUTES = 180
 TEMP_MAINTENANCE_INTERVAL_SECONDS = 120  # Min gap between temp-maintenance IR presses
 SCENE_ACTIVATION_DELAY = 1.0     # Short delay after activating some scenes
@@ -148,6 +156,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self.last_mode_change_time = None   # Track last mode change for cooldowns
         self._last_command_time = None      # Last time WE sent the on/off IR toggle
         self._last_heating_seen = None      # Last time the plug showed real heating
+        self._last_running_seen = None      # Last time the PLUG showed heat or fan (never set by a command)
+        self._pending_mode = None           # Latest on/off request held back (see COALESCE_SECONDS)
+        self._pending_task = None           # Applies _pending_mode once the heater has settled
+        self._applying_pending = False
         self._rest_peak_temp = None         # Warmest room reading since heating last stopped
         self._last_maintenance_time = None  # Last temp-maintenance IR press
         self._last_sync_reason = None       # Why the mode last changed without a user command
@@ -268,6 +280,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             "heat_started": self._heat_start_time.isoformat() if self._heat_start_time else None,
             "last_command": self._last_command_time.isoformat() if self._last_command_time else None,
             "last_sync_reason": self._last_sync_reason,
+            "pending_mode": self._pending_mode,
             "power_level": self._power_level(self.current_power_usage),
         }
 
@@ -289,6 +302,19 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         current_mode = self._attr_hvac_mode
 
         _LOGGER.debug("%s: async_set_hvac_mode called: requested=%s, current=%s", self.entity_id, hvac_mode, current_mode)
+
+        # Taps right after our own IR command: keep only the latest and apply it once
+        # the plug can show what the heater really did (see COALESCE_SECONDS).
+        if not self._applying_pending and self._last_command_time is not None:
+            since = (now - self._last_command_time).total_seconds()
+            if since < COALESCE_SECONDS:
+                self._pending_mode = hvac_mode
+                if self._pending_task is None or self._pending_task.done():
+                    self._pending_task = self.hass.async_create_task(self._apply_pending())
+                _LOGGER.info("%s: %s requested %.0f s after the last IR command; held until the heater settles.",
+                             self.entity_id, hvac_mode, since)
+                self.async_write_ha_state()
+                return
 
         if hvac_mode == current_mode:
              _LOGGER.debug("%s: Requested HVAC mode %s is already active.", self.entity_id, hvac_mode)
@@ -511,6 +537,38 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
 
     # --- Mode Sync (no IR sent) ---
+    async def _apply_pending(self):
+        """Apply the latest held on/off request once COALESCE_SECONDS passed since our last IR."""
+        try:
+            while True:
+                since = (datetime.now(timezone.utc) - self._last_command_time).total_seconds()                     if self._last_command_time else COALESCE_SECONDS
+                if since >= COALESCE_SECONDS:
+                    break
+                await asyncio.sleep(COALESCE_SECONDS - since + 1)
+            mode, self._pending_mode = self._pending_mode, None
+            if mode is None or mode == self._attr_hvac_mode:
+                self.async_write_ha_state()
+                return
+            if mode == HVACMode.OFF:
+                power = self.current_power_usage
+                running_now = power is not None and (self._is_heating(power) or self._is_fan(power))
+                ran_since_command = (self._last_running_seen is not None and self._last_command_time is not None
+                                     and self._last_running_seen > self._last_command_time)
+                if power is not None and not running_now and not ran_since_command:
+                    # Our last ON never reached the heater: it is off. A toggle would switch it ON.
+                    await self._stop_monitoring_task()
+                    for task in ("_verify_task", "_confirm_task", "_mode_task", "_fan_confirm_task"):
+                        self._cancel_task(task)
+                    self._sync_mode(HVACMode.OFF, "already_off")
+                    return
+            self._applying_pending = True
+            try:
+                await self.async_set_hvac_mode(mode)
+            finally:
+                self._applying_pending = False
+        except asyncio.CancelledError:
+            raise
+
     def _sync_mode(self, hvac_mode, reason):
         """Change the shown mode to match the real heater, without sending IR."""
         now = datetime.now(timezone.utc)
@@ -545,6 +603,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 now = datetime.now(timezone.utc)
                 power = self.current_power_usage
                 room = self.current_temperature
+                if self._is_heating(power) or self._is_fan(power):
+                    self._last_running_seen = now
                 if self._is_heating(power):
                     self._last_heating_seen = now
                     self._rest_peak_temp = None
@@ -557,6 +617,20 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 if timer_duration_minutes > 0 and self._heat_start_time:
                     elapsed_seconds = (now - self._heat_start_time).total_seconds()
                     if elapsed_seconds >= timer_duration_minutes * 60:
+                        # The OFF key is a TOGGLE: sent to a heater that is already off it
+                        # switches it ON. A thermostat rest lasts up to ~20 min; longer
+                        # without heating means it was switched off outside HA, so only
+                        # the shown mode changes. 2026-11-02: on at 01:34, off by 01:35,
+                        # timer toggled it at 02:24 after 49 min at 0 W.
+                        if (not fan_mode and self._last_heating_seen is not None
+                                and now - self._last_heating_seen > timedelta(minutes=MAX_REST_MINUTES)):
+                            _LOGGER.info(
+                                "%s: Timer expired but no heating for %.0f min: the heater is already off. "
+                                "Syncing to OFF without IR.",
+                                self.entity_id, (now - self._last_heating_seen).total_seconds() / 60,
+                            )
+                            self._sync_mode(HVACMode.OFF, "timer_already_off")
+                            break
                         _LOGGER.info(
                             "%s: Timer expired (elapsed %.1fs >= %d min). Turning OFF.",
                             self.entity_id, elapsed_seconds, timer_duration_minutes
@@ -954,6 +1028,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
         _LOGGER.debug("%s: Entity removing from HASS.", self.entity_id)
+        self._cancel_task("_pending_task")
         # Remove options listener
         if self._options_listener_remove:
             self._options_listener_remove()
