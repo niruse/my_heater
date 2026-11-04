@@ -126,10 +126,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         # --- Extract configuration from config_entry ---
         # Use .get for safer access, though name is usually set
         self._attr_name = self.config_entry.data.get("heater_name", "My Heater")
-        self._scene_turn_on_off = self.config_entry.data["scene_turn_on_off"]
         self._temperature_sensor = self.config_entry.data["temperature_sensor"]
-        self._temperature_up_scene = self.config_entry.data["temperature_up_scene"]
-        self._temperature_down_scene = self.config_entry.data["temperature_down_scene"]
 
         # Options can replace it (10-30: the downstairs entry pointed at a localtuya
         # sensor reading 10x the real watts)
@@ -182,6 +179,20 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
     def _option(self, key, default):
         """Return an option value: options -> data -> default."""
         return self.config_entry.options.get(key, self.config_entry.data.get(key, default))
+
+    # The IR keys: a scene (Tuya cloud) or a button (e.g. tuya_local_ir, sent on the
+    # LAN). Options can replace the ones chosen at setup.
+    @property
+    def _scene_turn_on_off(self):
+        return self._option("scene_turn_on_off", None)
+
+    @property
+    def _temperature_up_scene(self):
+        return self._option("temperature_up_scene", None)
+
+    @property
+    def _temperature_down_scene(self):
+        return self._option("temperature_down_scene", None)
 
     @property
     def _timer_duration_minutes(self) -> int:
@@ -971,15 +982,16 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         return await self._activate_scene(self._scene_turn_on_off, action_description)
 
     async def _activate_scene(self, scene_entity_id, action_description=""):
-        """Helper to call the scene.turn_on service."""
+        """Press one IR key: scene.turn_on, button.press or script.turn_on."""
         if not scene_entity_id:
              _LOGGER.error("%s: Scene entity ID missing for action: %s", self.entity_id, action_description)
              return False
         _LOGGER.debug("%s: Activating scene '%s' for action: %s", self.entity_id, scene_entity_id, action_description)
         try:
+            domain = scene_entity_id.split(".", 1)[0]
             await self.hass.services.async_call(
-                domain="scene",
-                service="turn_on",
+                domain=domain,
+                service="press" if domain == "button" else "turn_on",
                 service_data={"entity_id": scene_entity_id},
                 blocking=True
             )

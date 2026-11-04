@@ -6,7 +6,7 @@
                 "description": "Set up your heater",
                 "data": {
                     "heater_name": "Heater Name",
-                    "scene_turn_on_off": "Scene to turn on/off",
+                    "scene_turn_on_off": "On/off key (scene or button)",
                     "mode_button": "Mode button (optional, adds fan only)"
                 }
             }
@@ -23,7 +23,10 @@
                     "idle_off_minutes": "Show OFF after this many minutes without heating (0 = never)",
                     "temperature_maintenance": "Press UP/DOWN automatically to hold the target",
                     "mode_button": "Mode button (optional, adds fan only)",
-                    "power_usage": "Power sensor of the heater's plug"
+                    "power_usage": "Power sensor of the heater's plug",
+                    "scene_turn_on_off": "On/off key (scene or button)",
+                    "temperature_up_scene": "Temperature up key (scene or button)",
+                    "temperature_down_scene": "Temperature down key (scene or button)"
                 },
                 "data_description": {
                     "power_threshold": "Readings below this are not heating. Keep it above the small draw the heater has while winding down after OFF (about 21 W).",

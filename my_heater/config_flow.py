@@ -112,6 +112,20 @@ class MyHeaterOptionsFlowHandler(config_entries.OptionsFlow):
                     description={"suggested_value": self._current(CONF_MODE_BUTTON, None)},
                 ): selector({"entity": {"domain": ["button", "scene"]}}),
 
+                # The IR keys: scenes (Tuya cloud) or buttons (tuya_local_ir, on the LAN)
+                vol.Required(
+                    "scene_turn_on_off",
+                    default=self._current("scene_turn_on_off", None),
+                ): selector({"entity": {"domain": ["scene", "button", "script"]}}),
+                vol.Required(
+                    "temperature_up_scene",
+                    default=self._current("temperature_up_scene", None),
+                ): selector({"entity": {"domain": ["scene", "button", "script"]}}),
+                vol.Required(
+                    "temperature_down_scene",
+                    default=self._current("temperature_down_scene", None),
+                ): selector({"entity": {"domain": ["scene", "button", "script"]}}),
+
                 # Add other options here in the future
             }
         )
@@ -156,9 +170,9 @@ class MyHeaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         initial_schema = vol.Schema(
              {
                 vol.Required("heater_name"): str,
-                vol.Required("scene_turn_on_off"): selector({"entity": {"domain": "scene"}}),
-                vol.Required("temperature_up_scene"): selector({"entity": {"domain": "scene"}}),
-                vol.Required("temperature_down_scene"): selector({"entity": {"domain": "scene"}}),
+                vol.Required("scene_turn_on_off"): selector({"entity": {"domain": ["scene", "button", "script"]}}),
+                vol.Required("temperature_up_scene"): selector({"entity": {"domain": ["scene", "button", "script"]}}),
+                vol.Required("temperature_down_scene"): selector({"entity": {"domain": ["scene", "button", "script"]}}),
                 vol.Required("temperature_sensor"): selector({"entity": {"domain": "sensor", "device_class": "temperature"}}),
                 vol.Required("min_temp", default=16): vol.Coerce(float),
                 vol.Required("max_temp", default=30): vol.Coerce(float),
