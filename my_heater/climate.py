@@ -68,6 +68,12 @@ FAN_MIN_WATTS = 10
 FAN_MAX_WATTS = 60
 FAN_CONFIRM_SECONDS = 60
 MODE_STEP_SECONDS = 45           # wait after each mode press before reading the plug
+# A 0 W reading right after our IR is the plug not having reported yet, not proof
+# of heat: after a power cut the plug is still reconnecting and reports late, and
+# the heater itself comes back in fan only (Nir, 2026-11-04). Wait this much longer
+# for a reading that arrived after the press.
+MODE_FRESH_WAIT_SECONDS = 90
+MODE_FRESH_POLL_SECONDS = 15
 # A press sometimes moves the heater two levels (the IR lands twice: 10-30, high ->
 # fan -> low within ~15 s on both bathroom heaters), so allow two full turns.
 MODE_MAX_PRESSES = 6
@@ -157,6 +163,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._last_command_time = None      # Last time WE sent the on/off IR toggle
         self._last_heating_seen = None      # Last time the plug showed real heating
         self._last_running_seen = None      # Last time the PLUG showed heat or fan (never set by a command)
+        self._last_power_event = None       # Last time the plug reported any reading
+        self._heat_unverified = False       # HEAT stepping ended before the plug showed the result
         self._pending_mode = None           # Latest on/off request held back (see COALESCE_SECONDS)
         self._pending_task = None           # Applies _pending_mode once the heater has settled
         self._applying_pending = False
@@ -519,6 +527,22 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 if not self._is_heating(power) and not self._is_fan(power):
                     _LOGGER.debug("%s: OFF verified after %s (power %s).", self.entity_id, reason, power)
                     return
+                # A reading from before the toggle (late plug) is no reason to resend:
+                # the resend would switch a heater that did go off back on. Nor is a
+                # fan-band reading younger than the wind-down tail (up to ~41 s).
+                waited = 0
+                while waited < MODE_FRESH_WAIT_SECONDS and not (
+                        self._fresh_reading()
+                        and not (self._is_fan(self.current_power_usage)
+                                 and (datetime.now(timezone.utc) - self._last_power_event).total_seconds() < FAN_CONFIRM_SECONDS)):
+                    await asyncio.sleep(MODE_FRESH_POLL_SECONDS)
+                    waited += MODE_FRESH_POLL_SECONDS
+                    if self._attr_hvac_mode != HVACMode.OFF:
+                        return
+                power = self.current_power_usage
+                if not self._is_heating(power) and not self._is_fan(power):
+                    _LOGGER.debug("%s: OFF verified late after %s (power %s).", self.entity_id, reason, power)
+                    return
                 if attempt < OFF_VERIFY_RETRIES:
                     _LOGGER.warning(
                         "%s: Still drawing %.1f W %ds after %s. Sending OFF toggle again.",
@@ -577,6 +601,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._last_sync_reason = reason
         self._rest_peak_temp = None
         self._fan_zero_passes = 0
+        self._heat_unverified = False
         if hvac_mode in (HVACMode.HEAT, HVACMode.FAN_ONLY):
             if self._heat_start_time is None:
                 self._heat_start_time = now
@@ -753,9 +778,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             return
 
         now = datetime.now(timezone.utc)
+        self._last_power_event = now
         if self._is_heating(power):
             self._last_heating_seen = now
             self._rest_peak_temp = None
+            self._heat_unverified = False
         if self._attr_hvac_mode != HVACMode.OFF:
             self.async_write_ha_state()  # hvac_action follows the plug
 
@@ -831,6 +858,14 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 and not self._in_settle_window()
                 and not self._stepping_mode()
             ):
+                if self._attr_hvac_mode == HVACMode.HEAT and self._heat_unverified and self._mode_button:
+                    # We asked for heat but stopped before the plug answered (late plug,
+                    # e.g. after a power cut): the heater is in fan only, step it on.
+                    self._heat_unverified = False
+                    _LOGGER.info("%s: %.1f W held %ds after an unverified HEAT: stepping out of fan only.",
+                                 self.entity_id, power, FAN_CONFIRM_SECONDS)
+                    self._mode_task = self.hass.async_create_task(self._step_mode_to(HVACMode.HEAT))
+                    return
                 _LOGGER.info("%s: %.1f W held %ds: fan only. Setting mode to FAN_ONLY.",
                              self.entity_id, power, FAN_CONFIRM_SECONDS)
                 self._sync_mode(HVACMode.FAN_ONLY, "fan_detected")
@@ -845,13 +880,26 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         before reading; pressing faster would skip past the wanted mode.
         """
         try:
+            self._heat_unverified = False
+            sent = wait_first
+            temp_key_tried = False
             if wait_first:
                 await asyncio.sleep(MODE_STEP_SECONDS)  # the ON toggle lands first
             for press in range(MODE_MAX_PRESSES + 1):
                 if self._attr_hvac_mode != target:
                     return
+                if sent and not await self._wait_fresh_reading(target):
+                    return
                 power = self.current_power_usage
                 if power is None:
+                    return
+                if (target == HVACMode.HEAT and sent and not self._is_heating(power) and not self._is_fan(power)
+                        and not self._fresh_reading()):
+                    # Still the pre-command 0 W: the result is unknown. Leave HEAT and let
+                    # a later fan-band reading finish the job (_confirm_fan).
+                    self._heat_unverified = True
+                    _LOGGER.info("%s: Plug has not reported since the last IR (%.1f W); HEAT not verified yet.",
+                                 self.entity_id, power)
                     return
                 if self._is_fan(power) == (target == HVACMode.FAN_ONLY):
                     _LOGGER.info("%s: Mode is %s (%.1f W) after %d press(es).", self.entity_id, target, power, press)
@@ -860,10 +908,43 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     _LOGGER.warning("%s: Still %.1f W after %d mode presses; %s not reached.",
                                     self.entity_id, power, press, target)
                     return
-                await self._press_mode(f"step to {target} ({press + 1})")
+                if (target == HVACMode.HEAT and press > 0 and not temp_key_tried
+                        and self._is_fan(power) and not self._fresh_reading()):
+                    # The bars press changed nothing: back from a power cut the heater
+                    # sits in fan only until a temperature key is pressed (Nir, 11-04).
+                    temp_key_tried = True
+                    self._last_command_time = datetime.now(timezone.utc)
+                    await self._activate_scene(self._temperature_up_scene, f"wake to heat ({press + 1})")
+                else:
+                    await self._press_mode(f"step to {target} ({press + 1})")
+                sent = True
                 await asyncio.sleep(MODE_STEP_SECONDS)
         except asyncio.CancelledError:
             pass
+
+    def _fresh_reading(self) -> bool:
+        """True when the plug reported after our last IR command."""
+        return (self._last_power_event is not None and self._last_command_time is not None
+                and self._last_power_event > self._last_command_time)
+
+    async def _wait_fresh_reading(self, target) -> bool:
+        """Wait up to MODE_FRESH_WAIT_SECONDS for a reading newer than our IR.
+
+        For HEAT a heating reading is an answer at once. A stale 0 W or fan reading is not:
+        the plug may simply not have reported yet. Fan with no report for this long
+        after a press means the press changed nothing.
+        Returns False when the mode was changed meanwhile.
+        """
+        waited = 0
+        while waited < MODE_FRESH_WAIT_SECONDS and not self._fresh_reading():
+            power = self.current_power_usage
+            if target == HVACMode.HEAT and power is not None and self._is_heating(power):
+                break
+            await asyncio.sleep(MODE_FRESH_POLL_SECONDS)
+            waited += MODE_FRESH_POLL_SECONDS
+            if self._attr_hvac_mode != target:
+                return False
+        return True
 
     async def _press_mode(self, action_description):
         """Press the mode button (button.press, or scene.turn_on for a scene)."""
