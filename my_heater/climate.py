@@ -37,10 +37,9 @@ MONITORING_INTERVAL_SECONDS = 30   # How often to check timer / idle / temp in H
 # 0.1-0.4 deg below its peak; switched off, the room kept falling (32.2 -> 28.2 in
 # 2.5 h). So: no heating and the room ROOM_DROP_OFF below its peak since the last
 # heating = off. With a room reading, the time-only idle-off waits this long instead.
-ROOM_DROP_OFF = 1.0
-# Longest thermostat rest (0 W while on) worth trusting: rests of 9-20 min were
-# seen on 2026-10-28. No heating for longer than this = the heater is off.
-MAX_REST_MINUTES = 25
+# 2026-11-04/05 (parents, on all night): rests of 57-151 min, the room fell up to 1.2
+# below the peak before each reheat, and 1.0 showed OFF for most of them.
+ROOM_DROP_OFF = 2.0
 # On/off requests within this many seconds of our last IR command are folded into
 # one: the plug shows the result 20-30 s late, so taps arrive before anyone can
 # see the first one worked, and every extra toggle flips the heater the other way
@@ -59,6 +58,11 @@ AUTO_ON_CONFIRM_SECONDS = 20
 # OFF double check: after the OFF toggle, power must be below the threshold by then.
 OFF_VERIFY_SECONDS = 90
 OFF_VERIFY_RETRIES = 1           # Extra OFF toggles if the heater is still drawing power
+# After a timer OFF pressed while the plug read ~0 W: a resting heater goes off and stays
+# quiet, an already-off one turns ON and heats. Its first burst can be over in ~65 s and
+# the plug reports ~20-30 s late, so watch the whole time rather than look once.
+TIMER_OFF_WATCH_SECONDS = 120
+TIMER_OFF_WATCH_POLL_SECONDS = 5
 # Fan-only mode (parents heater, 2026-10-30): the remote's bars button cycles
 # low heat (~950 W) -> high heat (~1860 W) -> fan only (~22 W) -> low heat, and the
 # plug shows each press 18-30 s later. The fan alone draws about what the wind-down
@@ -521,7 +525,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
 
     # --- OFF Double Check ---
-    async def _verify_off(self, reason):
+    async def _verify_off(self, reason, pressed_at_rest=False):
         """After an OFF toggle, confirm with the plug that heating stopped.
 
         Only a reading at or above the threshold counts as "still on": the ~21 W
@@ -530,6 +534,18 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         after OFF_VERIFY_SECONDS proves the toggle did not land and is safe to resend.
         """
         try:
+            if pressed_at_rest:
+                waited = 0
+                while waited < TIMER_OFF_WATCH_SECONDS:
+                    await asyncio.sleep(TIMER_OFF_WATCH_POLL_SECONDS)
+                    waited += TIMER_OFF_WATCH_POLL_SECONDS
+                    if self._attr_hvac_mode != HVACMode.OFF:
+                        return
+                    if self._is_heating(self.current_power_usage):
+                        _LOGGER.warning("%s: Heating started right after %s: the heater was already off "
+                                        "and the toggle turned it on. Toggling again.", self.entity_id, reason)
+                        await self._send_toggle(f"{reason} undo")
+                        break
             for attempt in range(OFF_VERIFY_RETRIES + 1):
                 await asyncio.sleep(OFF_VERIFY_SECONDS)
                 if self._attr_hvac_mode != HVACMode.OFF:
@@ -653,20 +669,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 if timer_duration_minutes > 0 and self._heat_start_time:
                     elapsed_seconds = (now - self._heat_start_time).total_seconds()
                     if elapsed_seconds >= timer_duration_minutes * 60:
-                        # The OFF key is a TOGGLE: sent to a heater that is already off it
-                        # switches it ON. A thermostat rest lasts up to ~20 min; longer
-                        # without heating means it was switched off outside HA, so only
-                        # the shown mode changes. 2026-11-02: on at 01:34, off by 01:35,
-                        # timer toggled it at 02:24 after 49 min at 0 W.
-                        if (not fan_mode and self._last_heating_seen is not None
-                                and now - self._last_heating_seen > timedelta(minutes=MAX_REST_MINUTES)):
-                            _LOGGER.info(
-                                "%s: Timer expired but no heating for %.0f min: the heater is already off. "
-                                "Syncing to OFF without IR.",
-                                self.entity_id, (now - self._last_heating_seen).total_seconds() / 60,
-                            )
-                            self._sync_mode(HVACMode.OFF, "timer_already_off")
-                            break
+                        # The plug can't tell a rest from off, and rests run past 2 h, so the
+                        # timer always presses OFF: it must not leave a 2 kW heater on all night
+                        # (2026-11-04/05). The key is a TOGGLE, so if the heater was already off
+                        # this turns it on; _verify_off sees it heat and presses again.
+                        pressed_at_rest = not self._is_heating(power) and not self._is_fan(power)
                         _LOGGER.info(
                             "%s: Timer expired (elapsed %.1fs >= %d min). Turning OFF.",
                             self.entity_id, elapsed_seconds, timer_duration_minutes
@@ -678,7 +685,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         self._last_sync_reason = "timer"
                         self.async_write_ha_state()
                         self._cancel_task("_verify_task")
-                        self._verify_task = self.hass.async_create_task(self._verify_off("timer OFF"))
+                        self._verify_task = self.hass.async_create_task(self._verify_off("timer OFF", pressed_at_rest))
                         break
 
                 # --- 1b. Fan only: the fan never rests, ~0 W means it was switched off ---
