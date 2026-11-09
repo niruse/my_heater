@@ -497,7 +497,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         """Start the background monitoring task if not already running."""
         if self._monitoring_task is None or self._monitoring_task.done():
             _LOGGER.debug("%s: Creating and starting monitoring task.", self.entity_id)
-            self._monitoring_task = self.hass.async_create_task(self._monitor_power_and_temperature())
+            # A background task: start-up must not wait for a loop that runs while the heater is on
+            # (2026-11-09: a plain task held HA's start-up ~20 min).
+            self._monitoring_task = self.hass.async_create_background_task(
+                self._monitor_power_and_temperature(), f"my_heater monitor {self.entity_id}")
         else:
              _LOGGER.debug("%s: Monitoring task already running or starting.", self.entity_id)
 
