@@ -45,6 +45,12 @@ ROOM_DROP_OFF = 2.0
 # see the first one worked, and every extra toggle flips the heater the other way
 # (2026-11-01 21:33-21:39: 11 presses, 3 toggles in 4 s).
 COALESCE_SECONDS = 40
+# A house power cut: the HA box booted this recently before the entity started (the HA
+# container shares the host kernel, so /proc/uptime is the host's). After a cut the
+# heater comes back in fan only and ignores the bars key until a temperature key is
+# pressed (Nir, 11-04 and again 11-12), so the first HEAT after one presses that key first.
+POWER_CUT_UPTIME_SECONDS = 900
+POWER_CUT_UNKNOWN_HOURS = 6        # last heating unknown: a boot this recent still counts
 IDLE_OFF_WITH_ROOM_TEMP_MINUTES = 180
 TEMP_MAINTENANCE_INTERVAL_SECONDS = 120  # Min gap between temp-maintenance IR presses
 SCENE_ACTIVATION_DELAY = 1.0     # Short delay after activating some scenes
@@ -110,6 +116,15 @@ async def async_setup_entry(
 
 
 # Inherit from RestoreEntity to enable state restoration
+def _host_uptime():
+    """Seconds since the host booted, or None (the HA container shares the host kernel)."""
+    try:
+        with open("/proc/uptime", encoding="ascii") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class MyHeaterClimate(ClimateEntity, RestoreEntity):
     """Representation of My Heater as a climate entity with state restoration."""
 
@@ -170,6 +185,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._pending_task = None           # Applies _pending_mode once the heater has settled
         self._applying_pending = False
         self._rest_peak_temp = None         # Warmest room reading since heating last stopped
+        self._power_cut_suspected = False   # Box booted with the entity (house power cut); cleared by real heating
         self._last_maintenance_time = None  # Last temp-maintenance IR press
         self._last_sync_reason = None       # Why the mode last changed without a user command
         self._power_sensor_listener_remove = None # To unsubscribe from power sensor updates
@@ -305,6 +321,8 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             "last_sync_reason": self._last_sync_reason,
             "pending_mode": self._pending_mode,
             "power_level": self._power_level(self.current_power_usage),
+            # Saved with the state: survives more restarts until the heater is seen heating
+            "power_cut_suspected": self._power_cut_suspected,
         }
 
     def _power_level(self, power):
@@ -804,6 +822,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             self._last_heating_seen = now
             self._rest_peak_temp = None
             self._heat_unverified = False
+            self._power_cut_suspected = False  # it heats again: the cut is behind it
         if self._attr_hvac_mode != HVACMode.OFF:
             self.async_write_ha_state()  # hvac_action follows the plug
 
@@ -929,10 +948,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     _LOGGER.warning("%s: Still %.1f W after %d mode presses; %s not reached.",
                                     self.entity_id, power, press, target)
                     return
-                if (target == HVACMode.HEAT and press > 0 and not temp_key_tried
-                        and self._is_fan(power) and not self._fresh_reading()):
-                    # The bars press changed nothing: back from a power cut the heater
-                    # sits in fan only until a temperature key is pressed (Nir, 11-04).
+                if (target == HVACMode.HEAT and not temp_key_tried and self._is_fan(power)
+                        and ((press > 0 and not self._fresh_reading())
+                             or self._power_cut_suspected)):
+                    # The bars press changed nothing, or the box just came back from a house
+                    # power cut: the heater sits in fan only until a temperature key is
+                    # pressed (Nir, 11-04 / 11-12), so press that (first, after a cut).
                     temp_key_tried = True
                     self._last_command_time = datetime.now(timezone.utc)
                     await self._activate_scene(self._temperature_up_scene, f"wake to heat ({press + 1})")
@@ -1024,6 +1045,29 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         # --- State Restoration ---
         last_state = await self.async_get_last_state() # From RestoreEntity
         restored_temp = None
+        if last_state is not None and last_state.attributes.get("power_cut_suspected"):
+            self._power_cut_suspected = True
+        uptime = await self.hass.async_add_executor_job(_host_uptime)
+        if uptime is not None:
+            booted = datetime.now(timezone.utc) - timedelta(seconds=uptime)
+            last_heat = None
+            if last_state is not None and last_state.attributes.get("last_heating_seen"):
+                try:
+                    last_heat = datetime.fromisoformat(last_state.attributes["last_heating_seen"])
+                except (TypeError, ValueError):
+                    last_heat = None
+            if last_heat is not None and self._last_heating_seen is None:
+                self._last_heating_seen = last_heat  # kept across restarts in every mode
+            # Just booted, or booted after this heater last heated (or recently, when that is
+            # unknown): the heater lost power with the box, or may have. A reboot without a
+            # cut costs one temperature press at most.
+            if (uptime < POWER_CUT_UPTIME_SECONDS
+                    or (last_heat is not None and last_heat < booted)
+                    or (last_heat is None and uptime < POWER_CUT_UNKNOWN_HOURS * 3600)):
+                _LOGGER.info("%s: the box booted at %s, after this heater last heated (%s): the next HEAT "
+                             "that lands in fan presses a temperature key first.", self.entity_id,
+                             booted.isoformat(timespec="seconds"), last_heat)
+                self._power_cut_suspected = True
 
         if last_state is not None:
             _LOGGER.debug("%s: Found last state: %s", self.entity_id, last_state)
