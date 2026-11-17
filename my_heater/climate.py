@@ -91,6 +91,19 @@ MODE_MAX_PRESSES = 6
 # (~1 kW), 3 = full heat (~2 kW). Watts at or above this read as level 3.
 FULL_HEAT_WATTS = 1500
 FAN_STOPPED_PASSES = 2           # monitor passes at ~0 W before FAN_ONLY shows OFF
+# Switched to HEAT while the heater's own dial is below the temperature it senses (Nir,
+# 2026-11-17: room 25, dial 23): it blows once and stops, nothing heats. Parents heater
+# that evening: 904 W 19:38:08-19:39:14, then 0 W. So during the warm-up, press
+# temperature up once every WAKE_NUDGE_INTERVAL_SECONDS while it does not heat.
+# A heater that works heats longer than that first blow (10-28 bathroom: runs of 131 and
+# 156 s before each rest), or heats a second time. Either ends the warm-up for this
+# session: later rests are the thermostat at its target and must never push the dial up
+# (the old temperature maintenance pressed UP ~35 times in a row, 2026-10-27).
+WAKE_NUDGE_IDLE_SECONDS = 120     # no heating for this long before a press
+WAKE_NUDGE_INTERVAL_SECONDS = 120 # one press per 2 minutes (Nir)
+WAKE_NUDGE_MAX_PRESSES = 10
+WAKE_NUDGE_WINDOW_MINUTES = 30    # only this soon after HEAT started
+WARMED_UP_SECONDS = 90           # 11-17 blow was 66 s
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -187,6 +200,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._rest_peak_temp = None         # Warmest room reading since heating last stopped
         self._power_cut_suspected = False   # Box booted with the entity (house power cut); cleared by real heating
         self._last_maintenance_time = None  # Last temp-maintenance IR press
+        self._wake_presses = 0              # Temperature-up presses of this warm-up (see WAKE_NUDGE_*)
+        self._last_wake_time = None
+        self._warmed_up = False             # A heating run of WARMED_UP_SECONDS seen this session
+        self._heat_run_start = None         # Start of the current unbroken heating run
+        self._heat_runs = 0                 # Heating runs finished this session
         self._last_sync_reason = None       # Why the mode last changed without a user command
         self._power_sensor_listener_remove = None # To unsubscribe from power sensor updates
 
@@ -323,6 +341,9 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             "power_level": self._power_level(self.current_power_usage),
             # Saved with the state: survives more restarts until the heater is seen heating
             "power_cut_suspected": self._power_cut_suspected,
+            # Saved with the state: a restart mid-session must not nudge a resting heater
+            "warmed_up": self._warmed_up,
+            "wake_presses": self._wake_presses,
         }
 
     def _power_level(self, power):
@@ -398,6 +419,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             self._attr_hvac_mode = HVACMode.HEAT
             if current_mode != HVACMode.FAN_ONLY or self._heat_start_time is None:
                 self._heat_start_time = now # Record start time for timer (fan -> heat keeps it)
+                self._reset_warm_up()
             self._rest_peak_temp = None  # a peak from an earlier session must not count
             self._last_heating_seen = now # Idle-off counts from here
             self.last_mode_change_time = now # Record mode change time
@@ -653,6 +675,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         if hvac_mode in (HVACMode.HEAT, HVACMode.FAN_ONLY):
             if self._heat_start_time is None:
                 self._heat_start_time = now
+                self._reset_warm_up()
             if hvac_mode == HVACMode.HEAT:
                 self._last_heating_seen = now
             self.hass.async_create_task(self._start_monitoring_task())
@@ -678,6 +701,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 room = self.current_temperature
                 if self._is_heating(power) or self._is_fan(power):
                     self._last_running_seen = now
+                self._track_heat_run(now, power)
                 if self._is_heating(power):
                     self._last_heating_seen = now
                     self._rest_peak_temp = None
@@ -769,6 +793,10 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                     self._sync_mode(HVACMode.OFF, "no_heating")
                     break
 
+                # --- 3b. Wake nudge: on in HEAT but the dial is below the room ---
+                if self._wake_nudge_due(now, power):
+                    await self._wake_nudge(now, power)
+
                 # --- 4. Temperature Maintenance (opt-in) ---
                 if self._temp_maintenance_enabled:
                     await self._maintain_temperature(now, power)
@@ -783,6 +811,71 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             _LOGGER.info("%s: Monitoring task stopped.", self.entity_id)
             if self._monitoring_task is asyncio.current_task():
                 self._monitoring_task = None
+
+    def _reset_warm_up(self):
+        """A new HEAT session: the dial may be below the room again."""
+        self._wake_presses = 0
+        self._last_wake_time = None
+        self._warmed_up = False
+        self._heat_run_start = None
+        self._heat_runs = 0
+
+    def _track_heat_run(self, now, power):
+        """Follow heating runs: one of WARMED_UP_SECONDS, or a second one, ends the warm-up."""
+        if power is None:
+            return
+        if self._is_heating(power):
+            if self._heat_run_start is None:
+                self._heat_run_start = now
+                if self._heat_runs >= 1:
+                    self._set_warmed_up("heats again on its own thermostat")
+            elif (now - self._heat_run_start).total_seconds() >= WARMED_UP_SECONDS:
+                self._set_warmed_up(f"heated {WARMED_UP_SECONDS} s without a break")
+            return
+        if self._heat_run_start is not None:
+            # The run ended; the plug reports start and end with the same lag
+            if (now - self._heat_run_start).total_seconds() >= WARMED_UP_SECONDS:
+                self._set_warmed_up(f"heated {(now - self._heat_run_start).total_seconds():.0f} s")
+            self._heat_runs += 1
+            self._heat_run_start = None
+
+    def _set_warmed_up(self, why):
+        if self._warmed_up:
+            return
+        self._warmed_up = True
+        _LOGGER.info("%s: Warmed up (%s): no more wake presses.", self.entity_id, why)
+        self.async_write_ha_state()
+
+    def _wake_nudge_due(self, now, power) -> bool:
+        """In the warm-up, idle with the heater on: time for one temperature-up press."""
+        return (
+            self._attr_hvac_mode == HVACMode.HEAT
+            and not self._warmed_up
+            and self._wake_presses < WAKE_NUDGE_MAX_PRESSES
+            and self._heat_start_time is not None
+            and (now - self._heat_start_time) <= timedelta(minutes=WAKE_NUDGE_WINDOW_MINUTES)
+            and power is not None
+            and not self._is_heating(power)
+            and not self._is_fan(power)
+            and self._last_heating_seen is not None
+            and (now - self._last_heating_seen).total_seconds() >= WAKE_NUDGE_IDLE_SECONDS
+            and (self._last_wake_time is None
+                 or (now - self._last_wake_time).total_seconds() >= WAKE_NUDGE_INTERVAL_SECONDS)
+            and not self._stepping_mode()
+            and not self._in_settle_window(now)
+            and (self._pending_task is None or self._pending_task.done())
+        )
+
+    async def _wake_nudge(self, now, power):
+        """Press temperature up once; the shown target follows the dial."""
+        self._wake_presses += 1
+        self._last_wake_time = now
+        _LOGGER.info("%s: HEAT but no heating for %d s (%.1f W, room %s): dial below the room? "
+                     "Temperature up (%d/%d).", self.entity_id, (now - self._last_heating_seen).total_seconds(),
+                     power, self.current_temperature, self._wake_presses, WAKE_NUDGE_MAX_PRESSES)
+        if await self._activate_scene(self._temperature_up_scene, f"wake nudge ({self._wake_presses})"):
+            self._attr_target_temperature = min(self._attr_target_temperature + 1, self._attr_max_temp)
+        self.async_write_ha_state()
 
     async def _maintain_temperature(self, now, power):
         """Press UP/DOWN when the room is far from target (only if enabled in options).
@@ -818,6 +911,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
 
         now = datetime.now(timezone.utc)
         self._last_power_event = now
+        self._track_heat_run(now, power)
         if self._is_heating(power):
             self._last_heating_seen = now
             self._rest_peak_temp = None
@@ -1167,6 +1261,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._heat_start_time = when("heat_started") or now
         self._last_heating_seen = seen or now
         self._rest_peak_temp = peak
+        # A state saved before warmed_up existed counts as warmed: never nudge a resting heater
+        self._warmed_up = bool(attrs.get("warmed_up", True))
+        try:
+            self._wake_presses = int(attrs.get("wake_presses") or 0)
+        except (TypeError, ValueError):
+            self._wake_presses = 0
         self.last_mode_change_time = now
         self._last_sync_reason = "restored"
         _LOGGER.info("%s: Restored HEAT (started %s).", self.entity_id, self._heat_start_time)
