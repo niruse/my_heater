@@ -102,6 +102,14 @@ FAN_STOPPED_PASSES = 2           # monitor passes at ~0 W before FAN_ONLY shows 
 WAKE_NUDGE_IDLE_SECONDS = 120     # no heating for this long before a press
 WAKE_NUDGE_INTERVAL_SECONDS = 120 # one press per 2 minutes (Nir)
 WAKE_NUDGE_MAX_PRESSES = 10
+WAKE_NUDGE_STEPS = 2              # dial steps per nudge (10 nudges = up to 20 degrees)
+# The heater's display sleeps: the first temperature key after a pause only wakes it and
+# shows the setting; only the next presses change it (proven live 2026-11-19 on the
+# parents heater: 10 single presses 2 min apart did nothing, 3 presses 1.5 s apart heated
+# at once; the old cloud scene did nothing alone either). So a run of temperature presses
+# starts with one wake press unless a temperature key went out within DISPLAY_AWAKE_SECONDS.
+DISPLAY_AWAKE_SECONDS = 4
+TEMP_KEY_GAP_SECONDS = 1.5
 WAKE_NUDGE_WINDOW_MINUTES = 30    # only this soon after HEAT started
 WARMED_UP_SECONDS = 90           # 11-17 blow was 66 s
 
@@ -200,6 +208,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         self._rest_peak_temp = None         # Warmest room reading since heating last stopped
         self._power_cut_suspected = False   # Box booted with the entity (house power cut); cleared by real heating
         self._last_maintenance_time = None  # Last temp-maintenance IR press
+        self._last_temp_key_time = None     # Last temperature key sent (the display stays awake briefly)
         self._wake_presses = 0              # Temperature-up presses of this warm-up (see WAKE_NUDGE_*)
         self._last_wake_time = None
         self._warmed_up = False             # A heating run of WARMED_UP_SECONDS seen this session
@@ -495,14 +504,7 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
             scene, action, steps = self._temperature_down_scene, "decrease", abs(difference)
 
         _LOGGER.debug("%s: Need to %s temperature by %d steps.", self.entity_id, action, steps)
-        success_count = 0
-        for i in range(steps):
-            _LOGGER.debug("%s: Activating %s scene (Step %d/%d)", self.entity_id, action, i + 1, steps)
-            if not await self._activate_scene(scene, f"{action} temp step {i+1}"):
-                 _LOGGER.error("%s: Stopping temperature change due to scene activation failure on step %d.", self.entity_id, i + 1)
-                 break # Stop trying if one activation fails
-            success_count += 1
-            await asyncio.sleep(1.5) # Delay between scene activations
+        success_count = await self._press_temp_keys(scene, steps, f"{action} temp")
 
         # Update internal target temperature based on successful steps
         # This makes the UI reflect the change even if not all steps completed
@@ -873,9 +875,36 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         _LOGGER.info("%s: HEAT but no heating for %d s (%.1f W, room %s): dial below the room? "
                      "Temperature up (%d/%d).", self.entity_id, (now - self._last_heating_seen).total_seconds(),
                      power, self.current_temperature, self._wake_presses, WAKE_NUDGE_MAX_PRESSES)
-        if await self._activate_scene(self._temperature_up_scene, f"wake nudge ({self._wake_presses})"):
-            self._attr_target_temperature = min(self._attr_target_temperature + 1, self._attr_max_temp)
+        done = await self._press_temp_keys(self._temperature_up_scene, WAKE_NUDGE_STEPS,
+                                           f"wake nudge ({self._wake_presses})")
+        if done:
+            self._attr_target_temperature = min(self._attr_target_temperature + done, self._attr_max_temp)
         self.async_write_ha_state()
+
+    async def _press_temp_keys(self, scene, steps, description) -> int:
+        """Press a temperature key `steps` times and return how many went out.
+
+        A sleeping display takes the first press as 'show the setting', so a run that does
+        not follow another temperature press within DISPLAY_AWAKE_SECONDS starts with one
+        extra wake press (it changes nothing on the heater).
+        """
+        now = datetime.now(timezone.utc)
+        if (self._last_temp_key_time is None
+                or (now - self._last_temp_key_time).total_seconds() > DISPLAY_AWAKE_SECONDS):
+            if not await self._activate_scene(scene, f"{description}: wake the display"):
+                return 0
+            self._last_temp_key_time = datetime.now(timezone.utc)
+            await asyncio.sleep(TEMP_KEY_GAP_SECONDS)
+        done = 0
+        for i in range(steps):
+            if not await self._activate_scene(scene, f"{description} {i + 1}/{steps}"):
+                _LOGGER.error("%s: %s stopped at step %d (key failed).", self.entity_id, description, i + 1)
+                break
+            done += 1
+            self._last_temp_key_time = datetime.now(timezone.utc)
+            if i < steps - 1:
+                await asyncio.sleep(TEMP_KEY_GAP_SECONDS)
+        return done
 
     async def _maintain_temperature(self, now, power):
         """Press UP/DOWN when the room is far from target (only if enabled in options).
@@ -893,11 +922,11 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
         if difference < -1 and not self._is_heating(power):
             _LOGGER.debug("%s: [Monitor] Temp too low (%.1f) & not heating. Activating UP scene.", self.entity_id, difference)
             self._last_maintenance_time = now
-            await self._activate_scene(self._temperature_up_scene, "monitor temp up")
+            await self._press_temp_keys(self._temperature_up_scene, 1, "monitor temp up")
         elif difference > 1 and self._is_heating(power):
             _LOGGER.debug("%s: [Monitor] Temp too high (%.1f) & heating. Activating DOWN scene.", self.entity_id, difference)
             self._last_maintenance_time = now
-            await self._activate_scene(self._temperature_down_scene, "monitor temp down")
+            await self._press_temp_keys(self._temperature_down_scene, 1, "monitor temp down")
 
 
     # --- Power Sensor Change Callback ---
