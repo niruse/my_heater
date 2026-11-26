@@ -64,6 +64,15 @@ AUTO_ON_CONFIRM_SECONDS = 20
 # OFF double check: after the OFF toggle, power must be below the threshold by then.
 OFF_VERIFY_SECONDS = 90
 OFF_VERIFY_RETRIES = 1           # Extra OFF toggles if the heater is still drawing power
+# A toggle the IR blaster did not take (unpowered, off the network) never reached the
+# heater, so it does not use up the one retry above: it is sent again once the blaster
+# is back. 2026-11-25: the timer's OFF did not land, the retry 90 s later met a blaster
+# whose USB had just been switched off for 3 minutes, and the heater ran 55 minutes more.
+OFF_SEND_FAIL_RETRIES = 10
+OFF_SEND_FAIL_WAIT_SECONDS = 60
+# The timer's OFF failed for good (heater shown as on again): the timer comes back this
+# soon instead of granting a whole new period.
+TIMER_OFF_FAILED_RETRY_MINUTES = 10
 # After a timer OFF pressed while the plug read ~0 W: a resting heater goes off and stays
 # quiet, an already-off one turns ON and heats. Its first burst can be over in ~65 s and
 # the plug reports ~20-30 s late, so watch the whole time rather than look once.
@@ -620,7 +629,21 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                         "%s: Still drawing %.1f W %ds after %s. Sending OFF toggle again.",
                         self.entity_id, power, OFF_VERIFY_SECONDS, reason,
                     )
-                    await self._send_toggle(f"{reason} retry {attempt + 1}")
+                    sent = await self._send_toggle(f"{reason} retry {attempt + 1}")
+                    fails = 0
+                    while not sent and fails < OFF_SEND_FAIL_RETRIES:
+                        fails += 1
+                        await asyncio.sleep(OFF_SEND_FAIL_WAIT_SECONDS)
+                        if self._attr_hvac_mode != HVACMode.OFF:
+                            return
+                        power = self.current_power_usage
+                        if not self._is_heating(power) and not self._is_fan(power):
+                            _LOGGER.debug("%s: OFF verified while waiting for the IR blaster after %s (power %s).",
+                                          self.entity_id, reason, power)
+                            return
+                        _LOGGER.warning("%s: The OFF toggle was not sent (IR blaster). Sending it again (%d/%d).",
+                                        self.entity_id, fails, OFF_SEND_FAIL_RETRIES)
+                        sent = await self._send_toggle(f"{reason} retry {attempt + 1} resend {fails}")
             # Still on after the retries: tell the truth instead of showing OFF
             still = HVACMode.FAN_ONLY if self._is_fan(power) else HVACMode.HEAT
             _LOGGER.error(
@@ -628,6 +651,12 @@ class MyHeaterClimate(ClimateEntity, RestoreEntity):
                 self.entity_id, power, OFF_VERIFY_RETRIES + 1, still,
             )
             self._sync_mode(still, "off_failed")
+            timer_minutes = self._timer_duration_minutes
+            if reason.startswith("timer") and timer_minutes > TIMER_OFF_FAILED_RETRY_MINUTES:
+                # the timer already ran out once: try again soon, not after a whole new period
+                self._heat_start_time = datetime.now(timezone.utc) - timedelta(
+                    minutes=timer_minutes - TIMER_OFF_FAILED_RETRY_MINUTES)
+                self.async_write_ha_state()
         except asyncio.CancelledError:
             pass
 
